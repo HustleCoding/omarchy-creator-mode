@@ -13,29 +13,44 @@ SUPER + ALT + R   → Saving… → Rendering studio cut 42% → "Studio cut sav
 
 ## Studio mode (Screen Studio-style cut)
 
-Studio is on by default (`S` toggles it, `B` cycles the background). While recording, `bin/creator-mode-track`
+Studio is on by default (`S` toggles it, `B` cycles the background, `F` cycles the format). While recording, `bin/creator-mode-track`
 logs the cursor from Hyprland's IPC socket (~60 Hz) and, if `/dev/input/event*` is readable, mouse clicks and
 the *fact* that a key was pressed (never which key). The real cursor is hidden in the capture
 (`gpu-screen-recorder -cursor no`, only when the installed recorder supports it and the tracker is running).
 After you stop, `bin/creator-mode-studio` renders `<name>-studio.mp4` next to the raw file:
 
-- **Auto-zoom** (1.8×) eased in just before each click, held while you click/type nearby, and spring-animated
-  back out; the camera follows the cursor with a dead zone instead of jittering.
-- **Smooth cursor** redrawn from the log (spring-smoothed, 1.4× size) with a **click ring**.
-- **Framing:** padding, rounded corners, soft drop shadow, and a gradient background from the current
-  Omarchy theme (or `midnight`, `sunset`, `ocean`, `forest`, `mono`, `#rrggbb[:#rrggbb]`, or an image path).
-- Audio is copied untouched. The raw recording is never modified; a failed or skipped render (`Esc`)
-  still leaves it saved.
+- **Auto-zoom** (1.8×) eased in just before each click, held while you click or type nearby. A typing burst
+  outside a zoom zooms in on the last click (the field you're typing into). Zooming and panning are one
+  eased move; the camera pans only once the cursor leaves a dead zone, so small moves don't shake it.
+- **Smooth cursor** redrawn from the log: jitter is filtered out, then spring-smoothed (`--smoothing 0..1`).
+  It's an anti-aliased arrow with a soft shadow, squishes on click with an expanding **click ring**, and
+  fades out after 2.5 s idle (`--hide-idle N`, `0` never).
+- **Motion blur** on fast cursor moves and fast camera moves (`--no-motion-blur` to turn it off).
+- **Framing:** padding, rounded corners, soft drop shadow (`--shadow 0..1`), optional inset border
+  (`--inset PX --inset-color #rrggbb`) and a background: the Omarchy theme gradient (default), `wallpaper`
+  (your current Omarchy wallpaper, blurred; `--blur N`), presets `midnight sunset ocean aurora candy peach
+  dusk lime forest slate mono`, `#rrggbb[:#rrggbb]`, or an image path.
+- **Formats:** `--format source|16:9|9:16|1:1|4:5`, `--size` (short side in px). When the aspect changes a lot
+  (e.g. landscape screen → 9:16) the recording is cropped to the format and the crop follows the cursor
+  (`--layout fill`); `--layout fit` keeps the whole screen on the background instead.
+- **Exports:** MP4 (default) or `--export gif` (palette-optimized, ≤720 px, `--gif-fps 15`).
+- **Speed:** `--quality preview` renders at half size, 30 fps, without motion blur (~8× faster).
+  `--encoder auto` (default) uses VAAPI (`h264_vaapi`) when a test encode on `/dev/dri/renderD*` works,
+  otherwise libx264; `--encoder vaapi|x264` forces one.
+- Audio is copied untouched (not in GIFs). The raw recording is never modified; a failed or skipped render
+  (`Esc`) still leaves it saved.
 
 Without access to `/dev/input` (you're not in the `input` group), clicks can't be seen and zooms follow
 where the cursor comes to rest instead. For click-accurate zooms: `sudo usermod -aG input $USER` and log in
 again. If the tracker can't start at all, Creator Mode records a normal video with the real cursor.
 
-Re-render any recording with other settings:
+Re-render any recording with other settings (output names get `-9x16`, `-preview`, `.gif` suffixes):
 
 ```bash
-~/.config/omarchy/plugins/hustlecoding.creator-mode/bin/creator-mode-studio render ~/Videos/creator-mode-….mp4 \
-  --background sunset --zoom 2.2 --padding 0.08
+S=~/.config/omarchy/plugins/hustlecoding.creator-mode/bin/creator-mode-studio
+$S render ~/Videos/creator-mode-….mp4 --background wallpaper --zoom 2.2 --inset 8
+$S render ~/Videos/creator-mode-….mp4 --format 9:16 --quality preview     # quick check for a Short/Reel
+$S render ~/Videos/creator-mode-….mp4 --format 1:1 --export gif --size 600
 ```
 
 Events are kept in `<recordings dir>/.creator-mode/<name>.events.jsonl` (cursor positions, click and keypress
@@ -94,7 +109,7 @@ Keys:
 
 | State | Keys |
 | --- | --- |
-| idle | `Enter`/`Space`/`R` full screen · `P` pick area/window/monitor, then countdown · `A` cycle audio (none → desktop → desktop+mic) · `S` studio on/off · `B` cycle background · `Esc`/`Q` close |
+| idle | `Enter`/`Space`/`R` full screen · `P` pick area/window/monitor, then countdown · `A` cycle audio (none → desktop → desktop+mic) · `S` studio on/off · `B` cycle background · `F` cycle format (source → 16:9 → 9:16 → 1:1) · `Esc`/`Q` close |
 | picking | Omarchy's picker keys: drag an area, click a window, `Enter` highlighted window, `Ctrl + Enter` whole monitor, `Esc` cancels back to idle |
 | countdown | `Esc` or the hotkey cancels |
 | recording | hotkey (`SUPER + ALT + R`) stops |
@@ -238,6 +253,7 @@ bash -n bin/creator-mode-rec
 shellcheck -x bin/creator-mode-rec install.sh uninstall.sh test/*.sh test/fake-recorder test/stand-in-recorder
 python3 -m py_compile bin/creator-mode-track bin/creator-mode-studio
 ./test/controller-test.sh        # needs ffmpeg/ffprobe + flock; fake recorder + fake Hyprland socket
+./test/studio-test.sh            # renders a synthetic clip with every format/export option
 ```
 
 Environment overrides (for testing only): `CREATOR_MODE_RECORDER`, `CREATOR_MODE_MONITOR`,

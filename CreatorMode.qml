@@ -34,9 +34,12 @@ Item {
   property bool studioAvailable: true
   property bool studioEnabled: true
   readonly property bool studioOn: studioAvailable && studioEnabled
-  readonly property var backgrounds: ["theme", "midnight", "sunset", "ocean", "forest", "mono"]
+  readonly property var backgrounds: ["theme", "wallpaper", "midnight", "sunset", "ocean", "aurora", "candy", "peach", "forest", "slate", "mono"]
   property int backgroundIndex: 0
   readonly property string background: backgrounds[backgroundIndex]
+  readonly property var formats: ["source", "16:9", "9:16", "1:1"]
+  property int formatIndex: 0
+  readonly property string format: formats[formatIndex]
   property bool recordingTracked: false
   property real renderProgress: 0
   property string studioFile: ""
@@ -186,6 +189,10 @@ Item {
     root.backgroundIndex = (root.backgroundIndex + 1) % root.backgrounds.length
   }
 
+  function cycleFormat() {
+    root.formatIndex = (root.formatIndex + 1) % root.formats.length
+  }
+
   function startRender() {
     root.renderProgress = 0
     root.studioFile = ""
@@ -193,7 +200,7 @@ Item {
     root.opened = true
     Qt.callLater(function() { keys.forceActiveFocus() })
     renderProc.result = null
-    renderProc.command = ["bash", root.controller, "render", root.recordingFile, "--background=" + root.background]
+    renderProc.command = ["bash", root.controller, "render", root.recordingFile, "--background=" + root.background, "--format=" + root.format]
     renderProc.running = true
   }
 
@@ -551,6 +558,7 @@ Item {
           else if (k === Qt.Key_A) root.audioIndex = (root.audioIndex + 1) % root.audioModes.length
           else if (k === Qt.Key_S) root.toggleStudio()
           else if (k === Qt.Key_B && root.studioOn) root.cycleBackground()
+          else if (k === Qt.Key_F && root.studioOn) root.cycleFormat()
           else if (k === Qt.Key_Escape || k === Qt.Key_Q) root.dismiss()
           else handled = false
         } else if (s === "rendering") {
@@ -634,7 +642,7 @@ Item {
             width: parent.width
             wrapMode: Text.Wrap
             text: root.studioOn
-              ? "Studio on · auto-zoom, smooth cursor, " + root.background + " background"
+              ? "Studio on · auto-zoom, smooth cursor, " + root.background + " background, " + (root.format === "source" ? "source size" : root.format)
               : (root.studioAvailable ? "Studio off · raw recording only" : "Studio unavailable (needs python3 + ffmpeg)")
             color: root.studioOn ? root.accent : root.muted
             font.family: root.fontFamily
@@ -667,6 +675,7 @@ Item {
           KeyAction { keyLabel: "A"; label: "Audio"; onActivated: root.audioIndex = (root.audioIndex + 1) % root.audioModes.length }
           KeyAction { keyLabel: "S"; label: "Studio"; onActivated: root.toggleStudio() }
           KeyAction { keyLabel: "B"; label: "Background"; visible: root.studioOn; onActivated: root.cycleBackground() }
+          KeyAction { keyLabel: "F"; label: "Format"; visible: root.studioOn; onActivated: root.cycleFormat() }
           KeyAction { keyLabel: "Esc"; label: "Close"; onActivated: root.dismiss() }
         }
 
