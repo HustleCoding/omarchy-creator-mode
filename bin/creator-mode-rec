@@ -405,7 +405,7 @@ cmd_start() {
     audio_tracks='"mix"'
   fi
 
-  local webcam_pid="" webcam_file=""
+  local webcam_pid="" webcam_file="" webcam_start=""
   if [[ $webcam == "on" ]]; then
     if [[ $studio != "on" ]] || ! studio_available; then
       studio_note="${studio_note:+$studio_note }The webcam bubble needs Studio on."
@@ -417,19 +417,19 @@ cmd_start() {
       setsid ffmpeg -hide_banner -loglevel error -nostdin -f "$WEBCAM_FORMAT" -i "$WEBCAM_DEVICE" -an \
         -c:v libx264 -preset ultrafast -crf 23 -g 60 -y "$webcam_file" </dev/null >>"$WEBCAM_LOG" 2>&1 9>&- &
       webcam_pid=$!
-      sleep 0.3
+      local waited=0
+      while kill -0 "$webcam_pid" 2>/dev/null && [[ ! -s $webcam_file ]] && ((waited < 50)); do
+        sleep 0.02
+        waited=$((waited + 1))
+      done
+      webcam_start=${EPOCHREALTIME/,/.}
+      sleep 0.1
       if ! kill -0 "$webcam_pid" 2>/dev/null; then
         studio_note="${studio_note:+$studio_note }Webcam failed: $(tail -n1 "$WEBCAM_LOG" | cut -c1-160)"
         webcam_pid="" webcam_file=""
       fi
     fi
   fi
-  if [[ $studio == "on" && -d $dir/.creator-mode ]]; then
-    printf '{"audio":[%s],"webcam":%s}\n' "$audio_tracks" \
-      "$([[ -n $webcam_file ]] && json_str "$(basename "$webcam_file")" || echo null)" \
-      >"$dir/.creator-mode/$(basename "${file%.mp4}").session.json"
-  fi
-
   : >"$LOG_FILE"
   # setsid detaches the recorder from the shell process so restarting
   # omarchy-shell (or closing the panel) never interrupts a recording; 9>&- keeps
@@ -441,8 +441,17 @@ cmd_start() {
 
   local deadline=$((EPOCHSECONDS + START_TIMEOUT))
   while kill -0 "$pid" 2>/dev/null && [[ ! -s $file ]] && ((EPOCHSECONDS < deadline)); do
-    sleep 0.1
+    sleep 0.02
   done
+  # When the recorder first writes is the best wall-clock anchor for frame 0;
+  # the renderer lines the cursor log and webcam up against it.
+  local rec_start=${EPOCHREALTIME/,/.}
+  if [[ $studio == "on" && -d $dir/.creator-mode ]]; then
+    printf '{"audio":[%s],"webcam":%s,"recStart":%s,"webcamStart":%s}\n' "$audio_tracks" \
+      "$([[ -n $webcam_file ]] && json_str "$(basename "$webcam_file")" || echo null)" \
+      "$rec_start" "${webcam_start:-null}" \
+      >"$dir/.creator-mode/$(basename "${file%.mp4}").session.json"
+  fi
 
   TRACKER_PID=$tracker_pid EVENTS=$events WEBCAM_PID=$webcam_pid WEBCAM=$webcam_file
   local session

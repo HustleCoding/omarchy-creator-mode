@@ -208,6 +208,7 @@ file=$(jq -r .file <<<"$out")
 session="$(dirname "$file")/.creator-mode/$(basename "${file%.mp4}").session.json"
 check "desktop and mic get separate tracks after the mix" bash -c "[ \"\$(grep -cx -- -a '$TMP/args')\" = 3 ] && grep -qxF -- 'default_output|default_input' '$TMP/args' && grep -qxF -- default_input '$TMP/args'"
 check "session file lists the tracks and the webcam" bash -c "jq -e '.audio == [\"mix\",\"system\",\"mic\"] and (.webcam | endswith(\".webcam.mkv\"))' '$session' >/dev/null"
+check "session file records when the recorder and webcam started" bash -c "jq -e '(.recStart | type) == \"number\" and (.webcamStart | type) == \"number\" and .recStart >= .webcamStart' '$session' >/dev/null"
 wpid=$(sed -n 's/^webcam_pid=//p' "$CREATOR_MODE_STATE_DIR/state")
 sleep 1
 run stop

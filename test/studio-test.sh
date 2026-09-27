@@ -87,6 +87,22 @@ check "forced vaapi without a device fails clearly" test "$(field .error)" = vaa
 CREATOR_MODE_VAAPI_DEVICE=/nonexistent render --encoder auto --out "$TMP/auto.mp4"
 check "auto encoder falls back to x264" test "$(field .encoder)" = x264
 
+offsets() {
+  python3 - "$STUDIO" <<'PY'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("studio", sys.argv[1])
+st = importlib.util.module_from_spec(importlib.util.spec_from_loader("studio", loader))
+loader.exec_module(st)
+meta = {"start": 100.0}
+assert abs(st.capture_offset(meta, {"recStart": 101.5}, 12.0, 9.0) - 1.5) < 1e-9
+assert st.capture_offset(meta, {}, 12.0, 9.0) == 3.0
+assert st.capture_offset(meta, {"recStart": "x"}, 12.0, 9.0) == 3.0
+assert abs(st.webcam_lead({"recStart": 101.5, "webcamStart": 101.25}, 20.0, 9.0) - 0.25) < 1e-9
+assert st.webcam_lead({}, 10.0, 9.0) == 1.0
+PY
+}
+check "cursor and webcam line up on the recorder's start mark, not the end mark" offsets
+
 echo
 echo "$pass passed, $failed failed"
 [ "$failed" -eq 0 ]

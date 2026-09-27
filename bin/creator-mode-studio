@@ -339,6 +339,28 @@ def load_events(path):
     return meta, moves, sorted(clicks), sorted(keys), end
 
 
+def _num(v):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def capture_offset(meta, session, end, duration):
+    """Tracker time of the video's first frame. The controller notes when the
+    recorder first wrote to the file; recorders drop a variable tail on stop,
+    so the tracker's end mark is only a fallback."""
+    rec, start = _num(session.get("recStart")), _num(meta.get("start"))
+    if rec is not None and start is not None and 0 <= rec - start < 30:
+        return rec - start
+    return (end - duration) if end is not None else 0.0
+
+
+def webcam_lead(session, cam_duration, duration):
+    """Seconds of webcam footage before the screen recording's first frame."""
+    rec, cam = _num(session.get("recStart")), _num(session.get("webcamStart"))
+    if rec is not None and cam is not None and 0 <= rec - cam < 30:
+        return rec - cam
+    return cam_duration - duration
+
+
 # ------------------------------------------------------------------ motion
 
 class Spring:
@@ -1104,9 +1126,7 @@ def render(opts):
         meta, moves, clicks, keys, end = load_events(events_path)
         region = meta["region"]
         sx, sy = w / float(region["w"]), h / float(region["h"])
-        # The tracker's end mark is written as the recorder is told to stop, so
-        # aligning ends absorbs the recorder's variable start-up delay.
-        offset = (end - duration) if end is not None else 0.0
+        offset = capture_offset(meta, session, end, duration)
 
         def map_xy(x, y):
             return (x - region["x"]) * sx, (y - region["y"]) * sy
@@ -1273,8 +1293,7 @@ def render(opts):
         use_webcam = has_webcam and cam["enabled"] and not opts.no_webcam
         if use_webcam:
             cam_info = probe(cam_path)
-            # the webcam starts before the screen recorder and stops with it
-            lead = cam_info["duration"] - duration
+            lead = webcam_lead(session, cam_info["duration"], duration)
             d = even(min(cw, ch) * cam["size"])
             margin = int(round(min(cw, ch) * 0.045))
             border = max(2, int(round(d * 0.025)))
