@@ -10,7 +10,7 @@ What it does (all local, ffmpeg + Python standard library only):
   * smooth cursor: redraws the cursor from the logged path with jitter
     removal and spring smoothing, fades it out while idle, squishes it on
     clicks and draws an expanding click ring
-  * motion blur on fast cursor moves and fast camera moves
+  * motion blur on fast cursor moves (and, with --camera-blur, fast camera moves)
   * a padded background (Omarchy theme, blurred wallpaper, presets, colors or
     an image) with rounded corners, an optional inset border and a soft shadow
   * export presets: source, 16:9, 9:16, 1:1, 4:5; MP4 or GIF; preview quality;
@@ -65,7 +65,7 @@ ZOOM_OUT = 0.95        # ease-out duration
 KEY_HOLD = 1.4         # typing keeps a zoom alive this long after the last key
 TYPE_GAP = 1.0         # keys closer than this are one typing burst
 TYPE_MIN = 3           # keys in a burst before it counts as typing
-MERGE_GAP = 1.2        # focus points closer than hold + this share one zoom
+MERGE_GAP = 2.5        # focus points closer than hold + this share one zoom (pan instead of out-and-in)
 DWELL_MOVE = 80        # logical px the cursor must travel before a rest counts
 DWELL_STILL = 6        # logical px of jitter allowed while resting
 DWELL_TIME = 0.45      # rest this long to count as a focus point
@@ -1244,7 +1244,7 @@ def render(opts):
             graph.append(f"{src}perspective=x0='{L}':y0='{T}':x1='{R}':y1='{T}':x2='{L}':y2='{B}':x3='{R}':y3='{B}'"
                          f":interpolation=cubic:eval=frame[z]")
             src = "[z]"
-            windows = blur_windows(camera, fps, vid_w, ch) if opts.motion_blur and not preview and not gif else []
+            windows = blur_windows(camera, fps, vid_w, ch) if opts.camera_blur and opts.motion_blur and not preview and not gif else []
             if windows:
                 enable = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in windows)
                 graph.append(f"{src}split[za][zb];[zb]tmix=frames=3:weights='1 2 1'[zbl];"
@@ -1452,6 +1452,8 @@ def main():
     r.add_argument("--cursor-scale", type=float, default=1.4, help="cursor size multiplier (default 1.4)")
     r.add_argument("--no-cursor", action="store_true", help="don't draw a cursor")
     r.add_argument("--no-motion-blur", dest="motion_blur", action="store_false")
+    r.add_argument("--camera-blur", action="store_true",
+                   help="also blur fast zoom/pan moves (frame blending; can ghost at 30 fps)")
     r.add_argument("--preset", default="medium", help="x264 preset (default medium)")
     r.add_argument("--crf", type=int, default=18, help="x264 quality, lower is better (default 18)")
     r.add_argument("--json-progress", action="store_true", help="machine-readable progress on stdout")

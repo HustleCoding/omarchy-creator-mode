@@ -25,7 +25,7 @@ After you stop, `bin/creator-mode-studio` renders `<name>-studio.mp4` next to th
 - **Smooth cursor** redrawn from the log: jitter is filtered out, then spring-smoothed (`--smoothing 0..1`).
   It's an anti-aliased arrow with a soft shadow, squishes on click with an expanding **click ring**, and
   fades out after 2.5 s idle (`--hide-idle N`, `0` never).
-- **Motion blur** on fast cursor moves and fast camera moves (`--no-motion-blur` to turn it off).
+- **Motion blur** on fast cursor moves (`--no-motion-blur` to turn it off). `--camera-blur` also blends frames during fast zoom/pan moves; it's off by default because frame blending ghosts text at 30 fps.
 - **Framing:** padding, rounded corners, soft drop shadow (`--shadow 0..1`), optional inset border
   (`--inset PX --inset-color #rrggbb`) and a background: the Omarchy theme gradient (default), `wallpaper`
   (your current Omarchy wallpaper, blurred; `--blur N`), presets `midnight sunset ocean aurora candy peach
