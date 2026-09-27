@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# TEST ONLY. Mimics gpu-screen-recorder's process contract (write the -o file
+# while running, finish on SIGINT) without capturing anything. Behaviour is
+# steered by FAKE_RECORDER_MODE: ok | exit-early | never-write | ignore-int.
+
+file=""
+while (( $# > 0 )); do
+  [[ $1 == "-o" ]] && file=$2
+  shift
+done
+
+case ${FAKE_RECORDER_MODE:-ok} in
+  exit-early) echo "gsr error: failed to load opengl" >&2; exit 1 ;;
+  never-write) while true; do sleep 0.1; done ;;
+  ignore-int) trap '' INT ;;
+  *) trap 'ffmpeg -loglevel error -y -f lavfi -i color=c=black:s=320x240:d=1 "$file"; exit 0' INT ;;
+esac
+
+printf 'partial' >"$file"
+while true; do sleep 0.1; done

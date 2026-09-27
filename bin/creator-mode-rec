@@ -1,0 +1,343 @@
+#!/bin/bash
+#
+# creator-mode-rec — recording controller for the Creator Mode Omarchy plugin.
+#
+#   creator-mode-rec check                       dependencies + output dir
+#   creator-mode-rec status                      idle | recording | crashed
+#   creator-mode-rec start [--audio=MODE]        MODE: none | desktop | desktop+mic
+#   creator-mode-rec stop                        stop OUR recording and verify the file
+#   creator-mode-rec reveal <file>               open the folder containing <file>
+#
+# Every command prints exactly one JSON object on stdout. Failures also exit
+# non-zero and carry {"ok":false,"error":<code>,"message":<human text>}.
+#
+# Only the recorder PID recorded in the state dir is ever signalled, and only
+# after /proc confirms it is still the process writing our output file.
+
+set -uo pipefail
+
+STATE_DIR="${CREATOR_MODE_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/creator-mode}"
+STATE_FILE="$STATE_DIR/state"
+LOG_FILE="$STATE_DIR/recorder.log"
+LOCK_FILE="$STATE_DIR/lock"
+RECORDER="${CREATOR_MODE_RECORDER:-gpu-screen-recorder}"
+START_TIMEOUT="${CREATOR_MODE_START_TIMEOUT:-8}"
+STOP_TIMEOUT="${CREATOR_MODE_STOP_TIMEOUT:-20}"
+
+json_str() {
+  local s
+  s=$(printf '%s' "${1-}" | tr -d '\000-\010\013\014\016-\037')
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/}
+  s=${s//$'\t'/\\t}
+  printf '"%s"' "$s"
+}
+
+fail() {
+  local code=$1 message=$2 extra=${3:-}
+  printf '{"ok":false,"error":%s,"message":%s%s}\n' "$(json_str "$code")" "$(json_str "$message")" "$extra"
+  exit 1
+}
+
+now_ms() { date +%s%3N; }
+
+output_dir() {
+  # shellcheck source=/dev/null
+  [[ -f ~/.config/user-dirs.dirs ]] && source ~/.config/user-dirs.dirs
+  echo "${OMARCHY_SCREENRECORD_DIR:-${XDG_VIDEOS_DIR:-$HOME/Videos}}"
+}
+
+ensure_output_dir() {
+  local dir
+  dir=$(output_dir)
+  if [[ ! -d $dir ]] && ! mkdir -p "$dir" 2>/dev/null; then
+    fail "output_dir" "Can't create the recordings folder: $dir"
+  fi
+  [[ -w $dir ]] || fail "output_dir" "The recordings folder isn't writable: $dir"
+  echo "$dir"
+}
+
+missing_deps() {
+  local missing=()
+  command -v "$RECORDER" >/dev/null 2>&1 || missing+=("$RECORDER")
+  command -v ffprobe >/dev/null 2>&1 || missing+=("ffprobe")
+  command -v flock >/dev/null 2>&1 || missing+=("flock")
+  if [[ -z ${CREATOR_MODE_MONITOR:-} ]]; then
+    command -v hyprctl >/dev/null 2>&1 || missing+=("hyprctl")
+    command -v jq >/dev/null 2>&1 || missing+=("jq")
+  fi
+  echo "${missing[*]:-}"
+}
+
+package_for() {
+  case $1 in
+  gpu-screen-recorder) echo "gpu-screen-recorder" ;;
+  ffprobe) echo "ffmpeg" ;;
+  flock) echo "util-linux" ;;
+  hyprctl) echo "hyprland" ;;
+  jq) echo "jq" ;;
+  *) echo "$1" ;;
+  esac
+}
+
+require_deps() {
+  local missing pkgs=() dep
+  missing=$(missing_deps)
+  [[ -z $missing ]] && return 0
+  for dep in $missing; do pkgs+=("$(package_for "$dep")"); done
+  fail "missing_dependency" "Missing: $missing. Install with: sudo pacman -S ${pkgs[*]}"
+}
+
+with_lock() {
+  mkdir -p "$STATE_DIR" || fail "state_dir" "Can't create $STATE_DIR"
+  exec 9>"$LOCK_FILE"
+  flock -w 5 9 || fail "busy" "Another Creator Mode command is still running. Try again in a moment."
+}
+
+load_state() {
+  PID=""
+  FILE=""
+  STARTED=""
+  [[ -f $STATE_FILE ]] || return 1
+  PID=$(sed -n 's/^pid=//p' "$STATE_FILE")
+  FILE=$(sed -n 's/^file=//p' "$STATE_FILE")
+  STARTED=$(sed -n 's/^started=//p' "$STATE_FILE")
+  [[ $PID =~ ^[0-9]+$ && -n $FILE ]]
+}
+
+# True only while PID is alive AND is the recorder writing our file (guards
+# against PID reuse after a crash or reboot).
+is_ours_alive() {
+  [[ -n ${PID:-} && -r /proc/$PID/cmdline ]] || return 1
+  local cmdline
+  cmdline=$(tr '\0' '\n' <"/proc/$PID/cmdline" 2>/dev/null) || return 1
+  grep -qxF -- "$FILE" <<<"$cmdline"
+}
+
+foreign_recorder_running() {
+  local pids p
+  pids=$(pgrep -f '^gpu-screen-recorder' 2>/dev/null) || return 1
+  for p in $pids; do
+    [[ $p == "${PID:-}" ]] || return 0
+  done
+  return 1
+}
+
+refresh_omarchy_indicator() {
+  command -v omarchy-shell >/dev/null 2>&1 && omarchy-shell -q omarchy.indicators refresh >/dev/null 2>&1
+  return 0
+}
+
+log_tail() {
+  [[ -f $LOG_FILE ]] || return 0
+  local lines
+  lines=$(grep -i 'error' "$LOG_FILE" | tail -n 2)
+  [[ -n $lines ]] || lines=$(grep -v '^[[:space:]]*$' "$LOG_FILE" | tail -n 3)
+  cut -c1-300 <<<"$lines"
+}
+
+focused_monitor() {
+  if [[ -n ${CREATOR_MODE_MONITOR:-} ]]; then
+    echo "$CREATOR_MODE_MONITOR"
+    return
+  fi
+  hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused == true) | .name' | head -n1
+}
+
+# Mirrors omarchy-capture-screenrecording: cap capture at 4K, else native.
+capture_size() {
+  [[ -n ${CREATOR_MODE_RESOLUTION:-} ]] && { echo "$CREATOR_MODE_RESOLUTION"; return; }
+  local width height
+  read -r width height < <(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused == true) | "\(.width) \(.height)"')
+  if [[ ${width:-0} =~ ^[0-9]+$ && ${height:-0} =~ ^[0-9]+$ ]] && ((width > 3840 || height > 2160)); then
+    echo "3840x2160"
+  else
+    echo "0x0"
+  fi
+}
+
+file_duration() {
+  ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | head -n1
+}
+
+cmd_check() {
+  local missing dir
+  missing=$(missing_deps)
+  if [[ -n $missing ]]; then
+    local pkgs=() dep
+    for dep in $missing; do pkgs+=("$(package_for "$dep")"); done
+    fail "missing_dependency" "Missing: $missing. Install with: sudo pacman -S ${pkgs[*]}"
+  fi
+  dir=$(ensure_output_dir) || exit 1
+  printf '{"ok":true,"outputDir":%s,"recorder":%s}\n' "$(json_str "$dir")" "$(json_str "$RECORDER")"
+}
+
+cmd_status() {
+  if ! load_state; then
+    PID=""
+    if foreign_recorder_running; then
+      printf '{"ok":true,"state":"idle","foreignRecording":true}\n'
+    else
+      printf '{"ok":true,"state":"idle","foreignRecording":false}\n'
+    fi
+    return
+  fi
+  if is_ours_alive; then
+    printf '{"ok":true,"state":"recording","pid":%s,"file":%s,"startedAt":%s}\n' "$PID" "$(json_str "$FILE")" "${STARTED:-0}"
+  else
+    printf '{"ok":true,"state":"crashed","file":%s,"startedAt":%s,"log":%s}\n' "$(json_str "$FILE")" "${STARTED:-0}" "$(json_str "$(log_tail)")"
+  fi
+}
+
+cmd_start() {
+  local audio="none" arg
+  for arg in "$@"; do
+    case $arg in
+    --audio=*) audio=${arg#*=} ;;
+    *) fail "usage" "Unknown option: $arg" ;;
+    esac
+  done
+  case $audio in none | desktop | desktop+mic) ;; *) fail "usage" "Unknown audio mode: $audio" ;; esac
+
+  require_deps
+  with_lock
+
+  if load_state; then
+    if is_ours_alive; then
+      fail "already_recording" "Creator Mode is already recording." ",\"file\":$(json_str "$FILE")"
+    fi
+    rm -f "$STATE_FILE"
+  fi
+  PID=""
+  if foreign_recorder_running; then
+    fail "foreign_recording" "Another screen recording is already running (started outside Creator Mode). Stop it first, e.g. with Alt+Print."
+  fi
+
+  local dir monitor size file stamp n=1
+  dir=$(ensure_output_dir) || exit 1
+  monitor=$(focused_monitor)
+  [[ -n $monitor ]] || fail "no_monitor" "Couldn't find the focused monitor (hyprctl monitors returned nothing)."
+  size=$(capture_size)
+
+  stamp=$(date +'%Y-%m-%d_%H-%M-%S')
+  file="$dir/creator-mode-$stamp.mp4"
+  while [[ -e $file ]]; do
+    n=$((n + 1))
+    file="$dir/creator-mode-$stamp-$n.mp4"
+  done
+
+  local audio_args=()
+  case $audio in
+  desktop) audio_args=(-a "default_output" -ac aac) ;;
+  desktop+mic) audio_args=(-a "default_output|default_input" -ac aac) ;;
+  esac
+
+  : >"$LOG_FILE"
+  # setsid detaches the recorder from the shell process so restarting
+  # omarchy-shell (or closing the panel) never interrupts a recording; 9>&- keeps
+  # the long-lived recorder from inheriting (and holding) the control lock, and
+  # --default-signal undoes the SIGINT-ignore bash applies to background jobs.
+  setsid env --default-signal=INT "$RECORDER" -w "$monitor" -s "$size" -k auto -f 60 -fm cfr -fallback-cpu-encoding yes \
+    -o "$file" "${audio_args[@]}" </dev/null >>"$LOG_FILE" 2>&1 9>&- &
+  local pid=$!
+
+  local deadline=$((EPOCHSECONDS + START_TIMEOUT))
+  while kill -0 "$pid" 2>/dev/null && [[ ! -s $file ]] && ((EPOCHSECONDS < deadline)); do
+    sleep 0.1
+  done
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    wait "$pid" 2>/dev/null
+    local code=$?
+    rm -f "$file"
+    local detail
+    detail=$(log_tail)
+    fail "recorder_failed" "The recorder exited before recording started (exit $code).${detail:+ $detail}" ",\"log\":$(json_str "$LOG_FILE")"
+  fi
+
+  if [[ ! -s $file ]]; then
+    kill -INT "$pid" 2>/dev/null
+    sleep 1
+    kill -KILL "$pid" 2>/dev/null
+    rm -f "$file"
+    fail "start_timeout" "The recorder didn't start writing within ${START_TIMEOUT}s." ",\"log\":$(json_str "$LOG_FILE")"
+  fi
+
+  local started
+  started=$(now_ms)
+  printf 'pid=%s\nfile=%s\nstarted=%s\naudio=%s\n' "$pid" "$file" "$started" "$audio" >"$STATE_FILE.tmp"
+  mv "$STATE_FILE.tmp" "$STATE_FILE"
+  refresh_omarchy_indicator
+
+  printf '{"ok":true,"state":"recording","pid":%s,"file":%s,"startedAt":%s}\n' "$pid" "$(json_str "$file")" "$started"
+}
+
+cmd_stop() {
+  with_lock
+  load_state || fail "not_recording" "Creator Mode isn't recording."
+
+  if is_ours_alive; then
+    kill -INT "$PID" 2>/dev/null
+    local waited=0 limit=$((STOP_TIMEOUT * 10))
+    while is_ours_alive && ((waited < limit)); do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    if is_ours_alive; then
+      kill -KILL "$PID" 2>/dev/null
+      rm -f "$STATE_FILE"
+      refresh_omarchy_indicator
+      fail "save_timeout" "The recorder didn't finish saving within ${STOP_TIMEOUT}s and was force-stopped. The file may be incomplete." ",\"file\":$(json_str "$FILE")"
+    fi
+    CRASHED=false
+  else
+    CRASHED=true
+  fi
+
+  rm -f "$STATE_FILE"
+  refresh_omarchy_indicator
+
+  if [[ ! -s $FILE ]]; then
+    fail "no_output" "No video was saved. The recorder stopped without writing $FILE." ",\"log\":$(json_str "$LOG_FILE")"
+  fi
+
+  local duration size
+  duration=$(file_duration "$FILE")
+  if [[ ! $duration =~ ^[0-9.]+$ ]]; then
+    fail "invalid_output" "The saved file can't be read as a video: $FILE" ",\"file\":$(json_str "$FILE"),\"log\":$(json_str "$LOG_FILE")"
+  fi
+  size=$(stat -c %s "$FILE")
+
+  printf '{"ok":true,"state":"saved","file":%s,"dir":%s,"duration":%s,"size":%s,"recovered":%s}\n' \
+    "$(json_str "$FILE")" "$(json_str "$(dirname "$FILE")")" "$duration" "$size" "$CRASHED"
+}
+
+cmd_reveal() {
+  local file=${1:-} dir
+  [[ -n $file ]] || fail "usage" "reveal needs a file path"
+  dir=$(dirname "$file")
+  [[ -d $dir ]] || fail "not_found" "Folder no longer exists: $dir"
+
+  local launcher=()
+  command -v uwsm-app >/dev/null 2>&1 && launcher=(uwsm-app --)
+
+  if command -v nautilus >/dev/null 2>&1 && [[ -f $file ]]; then
+    setsid "${launcher[@]}" nautilus --new-window --select "$file" </dev/null >/dev/null 2>&1 &
+  elif command -v xdg-open >/dev/null 2>&1; then
+    setsid "${launcher[@]}" xdg-open "$dir" </dev/null >/dev/null 2>&1 &
+  else
+    fail "missing_dependency" "No file manager found (install nautilus or xdg-utils)."
+  fi
+  printf '{"ok":true,"dir":%s}\n' "$(json_str "$dir")"
+}
+
+case ${1:-} in
+check) cmd_check ;;
+status) cmd_status ;;
+start) shift; cmd_start "$@" ;;
+stop) cmd_stop ;;
+reveal) shift; cmd_reveal "$@" ;;
+*) fail "usage" "Usage: creator-mode-rec check|status|start [--audio=none|desktop|desktop+mic]|stop|reveal <file>" ;;
+esac
