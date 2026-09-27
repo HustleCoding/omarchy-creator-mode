@@ -681,15 +681,15 @@ Item {
   PanelWindow {
     id: pill
     visible: root.pillVisible
-    anchors { top: true; right: true }
-    margins { top: Style.gapsOut * 2; right: Style.gapsOut * 2 }
+    anchors { top: true }
+    margins { top: Style.gapsOut * 2 }
     implicitWidth: pillBody.width
     implicitHeight: pillBody.height
     color: "transparent"
     WlrLayershell.namespace: "creator-mode-indicator"
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
-    exclusionMode: ExclusionMode.Ignore
+    exclusionMode: ExclusionMode.Normal
 
     BorderSurface {
       id: pillBody

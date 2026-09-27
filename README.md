@@ -7,7 +7,7 @@ the active theme, and it installs only into your home directory.
 
 ```
 SUPER + ALT + R   → panel (idle)
-Enter             → 3 · 2 · 1 → REC ● 00:12   (top-right pill, not captured as a modal)
+Enter             → 3 · 2 · 1 → REC ● 00:12   (top-center pill, not captured as a modal)
 SUPER + ALT + R   → Saving… → "Recording saved" · path · O Open folder
 ```
 
@@ -35,7 +35,7 @@ Hyprland key ──► omarchy-shell shell summon hustlecoding.creator-mode '{"h
   CreatorMode.qml (overlay plugin, keepLoaded, runs inside Omarchy's Quickshell)
     phases: idle → countdown → starting → recording → saving → saved | error
     • centered card: layer-shell Overlay, exclusive keyboard focus (panel states)
-    • top-right REC pill: no keyboard focus, so you can keep working while recording
+    • top-center REC pill (below the bar): no keyboard focus, so you can keep working while recording
     • every action = one Process call, one JSON reply
                         │  bash bin/creator-mode-rec <cmd>
                         ▼
@@ -126,12 +126,28 @@ My cloud VM has no GPU and no Hyprland. Testing ran in an Arch Linux container w
 | Installer | Fresh install, re-install (1 block, no dupes), Lua parse of `bindings.lua`, user and default key collisions refused, uninstall ×2, `shell.json` otherwise unchanged | pass |
 | Keyboard focus | `wtype` into headless Sway | Keys reach the panel on first open. After the card is hidden and re-shown, headless Sway stops delivering keys to the new surface. **Omarchy's own menu shows the same behavior in this rig** (Esc stops working after re-open), so I treat it as a test-environment limitation. `O` / Open folder was verified directly through the controller (`reveal` opens Nautilus with the file selected). |
 
-**Still needs your machine (real Hyprland + GPU):**
+### Official Omarchy 4.0.4 VM (real Hyprland)
+
+A second pass ran on the official `omarchy-4.0.4.iso` installed in a QEMU/KVM VM (`omarchy 4.0.4-1`, Hyprland 0.56.2, Quickshell 0.3.1, gpu-screen-recorder 6.1.0). Keys were sent as virtual keyboard input through QEMU's monitor (QMP), so Hyprland handled the global bindings like a physical keyboard. The VM has a virtio GPU and no AMD/Intel/NVIDIA hardware.
+
+| Area | Result |
+| --- | --- |
+| `./install.sh` on a stock install | Validated, enabled, and bound `SUPER + ALT + R`. Re-running it added no second block. |
+| `SUPER + ALT + R` hotkey | Opens the panel. Pressing it while recording stops the recording. |
+| Keyboard focus across re-opens | Works: open, Esc, re-open, Esc, re-open, Enter all worked. The headless-Sway problem does not happen on Hyprland. |
+| Countdown + Esc cancel | 3 → 2 → 1 shown; Esc returns to idle with "Countdown cancelled". |
+| Monitor detection | `hyprctl monitors -j` found `Virtual-1` without an override. |
+| Real `gpu-screen-recorder` | **Failure path only.** With the plain virtio GPU it fails with `llvmpipe ... failed to load opengl`. With virgl it fails with `unknown gpu vendor: Mesa`. gpu-screen-recorder supports only AMD/Intel/NVIDIA GPUs. Both errors appear on the error card, and REC is never shown. |
+| Success path (wf-recorder stand-in, real Hyprland capture) | countdown → REC pill with a live timer → Saving… → Saved. The file was 1920x1080 and `ffprobe` read 11.7 s. `O` opened Nautilus on `~/Videos`. |
+| Foreign recorder guard | With an outside `gpu-screen-recorder` process running, start was refused and the outside process was left running. |
+| `./uninstall.sh` | Removed the binding block, the plugin dir, and the `shell.json` entry. The recordings were kept. |
+
+The VM showed that the REC pill in the top-right corner overlapped the bar and Omarchy's notification toasts. The pill now sits top-center, below the bar.
+
+**Still needs your machine (real GPU):**
 
 1. The real `gpu-screen-recorder` success path: file quality, encoder choice, audio (desktop / mic).
-2. Keyboard focus under Hyprland across re-opens (Esc, Enter, O on the saved card).
-3. The REC pill position and readability on your monitor and theme, including HiDPI.
-4. That the `SUPER + ALT + R` binding fires after `./install.sh` reloads Hyprland.
+2. The REC pill's readability on your monitor and theme, including HiDPI.
 
 ## Local test checklist
 
@@ -139,7 +155,7 @@ Run on the Omarchy desktop after `./install.sh`.
 
 - [ ] **Open:** `SUPER + ALT + R` shows the themed card: "Ready to record", "Full screen · focused monitor · No audio", key hints.
 - [ ] **Countdown cancel:** `Enter`, then `Esc` during the countdown. The card returns to idle with "Countdown cancelled". No file is created, and `pgrep -a gpu-screen-recorder` prints nothing.
-- [ ] **Start:** `Enter` shows 3 → 2 → 1, the card disappears, and the top-right **● REC 00:00** pill counts up. `pgrep -a gpu-screen-recorder` shows one process.
+- [ ] **Start:** `Enter` shows 3 → 2 → 1, the card disappears, and the top-center **● REC 00:00** pill counts up. `pgrep -a gpu-screen-recorder` shows one process.
 - [ ] **Duplicate guard:** press `ALT + PRINT` (Omarchy's recorder) while Creator Mode is idle, then `SUPER + ALT + R` → `Enter`. You get the "Another recording is running" error, and the other recording keeps running. Stop it with `ALT + PRINT`.
 - [ ] **Stop:** while recording, press `SUPER + ALT + R`. The pill shows **Saving…**, then the card shows "Recording saved" with duration, size, and the full path.
 - [ ] **Saved output:** `ffprobe <path>` reports a duration close to the timer; the file plays in your video player.
@@ -158,7 +174,7 @@ Run on the Omarchy desktop after `./install.sh`.
 | 0:18 | Press `SUPER + ALT + R` | "Here's the panel. It picks up my theme, shows which monitor it will capture, and every action has a key." |
 | 0:25 | Press `Enter`, then `Esc` during the countdown | "Countdown, and Escape cancels it. Nothing was recorded." |
 | 0:30 | Press `Enter`, let 3-2-1 finish | "Now for real: three, two, one…" |
-| 0:34 | Point at the top-right pill, do something on screen | "The red REC pill only shows up once the recorder has actually started writing. The timer is live." |
+| 0:34 | Point at the top-center pill, do something on screen | "The red REC pill only shows up once the recorder has actually started writing. The timer is live." |
 | 0:44 | Press `SUPER + ALT + R` | "Same key to stop. It says Saving until the file is finalized and verified…" |
 | 0:48 | Saved card | "…and here's the exact file, with length and size." |
 | 0:52 | Press `O` | "O opens the folder with the file selected. That's it: countdown, record, stop, done, all from the keyboard." |
@@ -167,7 +183,9 @@ Run on the Omarchy desktop after `./install.sh`.
 
 **Works (verified in the container rig):** plugin validation, enable, and summon on Omarchy 4.0.4's real shell; themed idle, countdown, cancel, REC pill with timer, Saving…, Saved, and error states; real Wayland capture through the stand-in with a verified MP4; duplicate and foreign-recording refusal; PID-scoped stop; readable dependency and recorder errors; an idempotent, collision-checked, reversible installer.
 
-**Not verified here:** a real `gpu-screen-recorder` recording (no GPU in the cloud), Hyprland keyboard focus across re-opens, audio capture, and real-monitor readability. Those are items 1–4 above; the checklist covers them.
+**Also verified on the official Omarchy 4.0.4 VM (real Hyprland):** the hotkey, keyboard focus across re-opens, monitor detection, Open folder, the foreign-recorder guard, and install/uninstall.
+
+**Not verified here:** a real `gpu-screen-recorder` recording (it needs an AMD/Intel/NVIDIA GPU), audio capture, and readability on a real monitor. Those are items 1–2 above; the checklist covers them.
 
 **Known limitations:**
 
