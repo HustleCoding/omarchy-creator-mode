@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "hustlecoding.creator-mode",
+  "name": "Creator Mode",
+  "version": "0.1.0",
+  "author": "HustleCoding",
+  "description": "Keyboard-driven screen recording panel with a 3-2-1 countdown, live timer, and saved-file handoff",
+  "kinds": ["overlay"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "CreatorMode.qml"
+  }
+}

@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# TEST ONLY. Accepts gpu-screen-recorder's command line and records with
+# wf-recorder instead, for environments without a GPU (e.g. CI containers
+# running headless sway). Never install this on a real desktop.
+
+monitor="" file=""
+while (( $# > 0 )); do
+  case $1 in
+    -w) monitor=$2; shift 2 ;;
+    -o) file=$2; shift 2 ;;
+    -s | -k | -f | -fm | -fallback-cpu-encoding | -a | -ac) shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+[[ -n $monitor && -n $file ]] || { echo "stand-in: need -w and -o" >&2; exit 2; }
+if [[ $monitor =~ ^([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+)$ ]]; then
+  exec wf-recorder -y -g "${BASH_REMATCH[3]},${BASH_REMATCH[4]} ${BASH_REMATCH[1]}x${BASH_REMATCH[2]}" -c libx264 -r 30 -f "$file"
+fi
+exec wf-recorder -y -o "$monitor" -c libx264 -r 30 -f "$file"
