@@ -7,7 +7,7 @@ the active theme, and it installs only into your home directory.
 
 ```
 SUPER + ALT + R   → panel (idle)
-Enter             → 3 · 2 · 1 → REC ● 00:12   (top-center pill, not captured as a modal)
+Enter             → 3 · 2 · 1 → recording (nothing on screen; Omarchy's bar shows its recording dot)
 SUPER + ALT + R   → Saving… → Rendering studio cut 42% → "Studio cut saved" · path · O Open folder
 ```
 
@@ -109,7 +109,7 @@ Hyprland key ──► omarchy-shell shell summon hustlecoding.creator-mode '{"h
   CreatorMode.qml (overlay plugin, keepLoaded, runs inside Omarchy's Quickshell)
     phases: idle → [picking →] countdown → starting → recording → saving → saved | error
     • centered card: layer-shell Overlay, exclusive keyboard focus (panel states)
-    • top-center REC pill (below the bar): no keyboard focus, so you can keep working while recording
+    • no on-screen pill while recording (layer surfaces are captured); a Saving… pill after stop
     • every action = one Process call, one JSON reply
                         │  bash bin/creator-mode-rec <cmd>
                         ▼

@@ -349,12 +349,19 @@ function speedRange() {
   ed.speed.push({ start: range[0], end: range[1], rate: 2 }); ed.speed.sort((a, b) => a.start - b.start);
   selected = { kind: "speed", index: ed.speed.findIndex((s) => s.start === range[0]) }; range = null; changed();
 }
+function cursorAt(t) {
+  const tr = plan.cursorTrack || [];
+  let best = null;
+  for (const p of tr) { if (p[0] > t + 0.3) break; best = p; }
+  return best ? [best[1], best[2]] : (tr.length ? [tr[0][1], tr[0][2]] : null);
+}
 function addZoom() {
   snapshot(); ownZooms();
   const a = range ? range[0] : video.currentTime, b = range ? range[1] : Math.min(D(), video.currentTime + 2.5);
   if (b - a < MIN) { history.pop(); return; }
   ed.zooms = ed.zooms.filter((z) => z.end <= a || z.start >= b);
-  const z = { start: a, end: b, zoom: 1.8, x: 0.5, y: 0.5, follow: false };
+  const at = cursorAt(a);
+  const z = { start: a, end: b, zoom: 1.8, x: at ? at[0] : 0.5, y: at ? at[1] : 0.5, follow: !!at };
   ed.zooms.push(z); ed.zooms.sort((p, q) => p.start - q.start);
   selected = { kind: "zoom", index: ed.zooms.indexOf(z) }; range = null; changed();
 }

@@ -58,6 +58,7 @@ PY
 plan
 check "plan without edits: full length, auto zooms" test "$(field '.ok and .outputDuration == 6 and (.autoSegments | length) >= 1 and .edits.zooms == null')" = true
 check "plan reports a single mixed track without a session file" test "$(field '.audioTracks == ["mix"] and .webcam == false')" = true
+check "plan exposes a coarse cursor track for the editor" test "$(field '(.cursorTrack | length) > 10 and (.cursorTrack[0] | length) == 3')" = true
 
 edits '{"trim":[0.5,5.5],"cuts":[[2,3]],"speed":[{"start":3.5,"end":5,"rate":3}]}'
 plan

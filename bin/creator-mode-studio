@@ -445,6 +445,25 @@ def position_at(cursor, t, fps):
     return next((p for p in cursor[n:] if p is not None), None)
 
 
+def explicit_focus(zoom, clicks, cursor, fps, w, h):
+    """Focus points for a zoom set in the editor: its anchor, then every click
+    inside it when it follows the cursor."""
+    focus = [(zoom["start"], zoom["x"] * w, zoom["y"] * h)]
+    if zoom["follow"]:
+        for t in clicks:
+            p = position_at(cursor, t, fps) if zoom["start"] < t < zoom["end"] else None
+            if p is not None:
+                focus.append((t, p[0], p[1]))
+    return focus
+
+
+def cursor_track_json(cursor, fps, w, h, rate=10):
+    """Cursor positions as [t, x, y] (0..1) at a coarse rate, for the editor."""
+    step = max(1, int(round(fps / rate)))
+    return [[round(n / fps, 2), round(p[0] / w, 4), round(p[1] / h, 4)]
+            for n, p in ((n, cursor[n]) for n in range(0, len(cursor), step)) if p is not None]
+
+
 def zoom_segments(focus_times, key_times, duration, cursor, fps, zoom):
     """Zoom segments: {"start", "end", "zoom", "focus": [(t, x, y), ...]}.
 
@@ -1111,7 +1130,7 @@ def render(opts):
     auto_segments = [seg_json(sg) for sg in segments]
     if edits["zooms"] is not None:
         segments = [{"start": z["start"], "end": z["end"], "zoom": z["zoom"], "follow": z["follow"],
-                     "focus": [(z["start"], z["x"] * w, z["y"] * h)]}
+                     "focus": explicit_focus(z, clicks_v, raw, fps, w, h)}
                     for z in edits["zooms"] if z["zoom"] > 1.0]
     cam_path = session.get("webcam")
     cam_path = os.path.join(os.path.dirname(sidecar(video, "")), os.path.basename(cam_path)) if isinstance(cam_path, str) else None
@@ -1123,6 +1142,7 @@ def render(opts):
                 "audio": info["audio"], "audioTracks": tracks if split_audio else (["mix"] if info["audio"] else []),
                 "webcam": has_webcam, "events": have_events, "autoSegments": auto_segments,
                 "segments": [seg_json(sg) for sg in segments], "edits": edits, "editsFile": edits_path,
+                "cursorTrack": cursor_track_json(raw, fps, w, h),
                 "outputDuration": out_duration}
 
     camera = camera_path(cursor, n_frames, fps, w, h, view, segments, layout == "fill")

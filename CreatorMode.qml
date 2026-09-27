@@ -63,7 +63,8 @@ Item {
   property bool foreignRecording: false
 
   readonly property bool cardVisible: opened && ["idle", "countdown", "rendering", "saved", "error"].indexOf(phase) !== -1
-  readonly property bool pillVisible: ["starting", "recording", "saving"].indexOf(phase) !== -1
+  // Layer surfaces are part of the capture, so nothing is shown while recording.
+  readonly property bool pillVisible: phase === "saving"
 
   // Theme
   readonly property string fontFamily: Style.font.menuFamily
