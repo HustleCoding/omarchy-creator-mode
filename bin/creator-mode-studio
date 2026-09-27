@@ -53,6 +53,7 @@ PRESETS = {
     "mono": ("#3f3f46", "#09090b"),
 }
 FORMATS = {"16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:5": (4, 5)}
+CORNERS = ("br", "bl", "tr", "tl")
 THEME_COLORS = os.path.expanduser("~/.local/state/omarchy/current/theme/colors.toml")
 WALLPAPER = os.path.expanduser("~/.local/state/omarchy/current/background")
 
@@ -150,6 +151,7 @@ def probe(video):
     return {
         "w": int(vs["width"]), "h": int(vs["height"]), "fps": fps, "duration": duration,
         "audio": any(s.get("codec_type") == "audio" for s in streams),
+        "audio_tracks": sum(1 for s in streams if s.get("codec_type") == "audio"),
     }
 
 
@@ -192,6 +194,124 @@ def vaapi_works(dev):
 def default_events_path(video):
     d, name = os.path.split(os.path.abspath(video))
     return os.path.join(d, ".creator-mode", os.path.splitext(name)[0] + ".events.jsonl")
+
+
+def sidecar(video, suffix):
+    d, name = os.path.split(os.path.abspath(video))
+    return os.path.join(d, ".creator-mode", os.path.splitext(name)[0] + suffix)
+
+
+def load_json(path, what):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise RenderError("bad_" + what, f"Can't read {path}: {e}") from e
+    return data if isinstance(data, dict) else None
+
+
+def num(v, lo, hi, default):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return default if math.isnan(v) else clamp(v, lo, hi)
+
+
+def clean_edits(edits, duration):
+    """Validated copy of an edit file: every time is clamped into the video."""
+    edits = edits if isinstance(edits, dict) else {}
+
+    def span(item):
+        if isinstance(item, dict):
+            a, b = item.get("start"), item.get("end")
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            a, b = item
+        else:
+            return None
+        a, b = num(a, 0, duration, None), num(b, 0, duration, None)
+        return (a, b) if a is not None and b is not None and b - a >= 0.05 else None
+
+    out = {"version": 1}
+    trim = span(edits.get("trim"))
+    out["trim"] = list(trim) if trim else [0.0, duration]
+    out["cuts"] = sorted(list(c) for c in map(span, edits.get("cuts") or []) if c)
+    out["speed"] = []
+    for item in edits.get("speed") or []:
+        sp = span(item)
+        if sp and isinstance(item, dict):
+            out["speed"].append({"start": sp[0], "end": sp[1], "rate": num(item.get("rate"), 0.25, 8.0, 1.0)})
+    out["speed"].sort(key=lambda x: x["start"])
+    zooms = edits.get("zooms")
+    if isinstance(zooms, list):
+        out["zooms"] = []
+        for item in zooms:
+            sp = span(item)
+            if sp and isinstance(item, dict):
+                out["zooms"].append({"start": sp[0], "end": sp[1], "zoom": num(item.get("zoom"), 1.0, 4.0, 1.8),
+                                     "x": num(item.get("x"), 0, 1, 0.5), "y": num(item.get("y"), 0, 1, 0.5),
+                                     "follow": bool(item.get("follow", True))})
+        out["zooms"].sort(key=lambda z: z["start"])
+    else:
+        out["zooms"] = None
+    audio = edits.get("audio") if isinstance(edits.get("audio"), dict) else {}
+    out["audio"] = {"system": num(audio.get("system"), 0, 3, 1.0), "mic": num(audio.get("mic"), 0, 3, 1.0),
+                    "denoise": bool(audio.get("denoise", False))}
+    cam = edits.get("webcam") if isinstance(edits.get("webcam"), dict) else {}
+    corner = cam.get("corner") if cam.get("corner") in CORNERS else "br"
+    out["webcam"] = {"enabled": bool(cam.get("enabled", True)), "corner": corner,
+                     "size": num(cam.get("size"), 0.1, 0.45, 0.24), "mirror": bool(cam.get("mirror", True))}
+    if isinstance(edits.get("render"), dict):
+        out["render"] = {k: v for k, v in edits["render"].items() if isinstance(v, (str, int, float, bool))}
+    return out
+
+
+def timeline_pieces(edits, duration):
+    """Kept source ranges with playback rates, [(start, end, rate)], after trim, cuts and speed-ups."""
+    ranges = [tuple(edits["trim"])]
+    for a, b in edits["cuts"]:
+        nxt = []
+        for s0, e0 in ranges:
+            if b <= s0 or a >= e0:
+                nxt.append((s0, e0))
+                continue
+            if a > s0:
+                nxt.append((s0, a))
+            if b < e0:
+                nxt.append((b, e0))
+        ranges = nxt
+    pieces = []
+    for s0, e0 in ranges:
+        cur = s0
+        for sp in edits["speed"]:
+            a, b = max(sp["start"], cur), min(sp["end"], e0)
+            if b <= a:
+                continue
+            if a > cur:
+                pieces.append((cur, a, 1.0))
+            pieces.append((a, b, sp["rate"]))
+            cur = b
+        if cur < e0:
+            pieces.append((cur, e0, 1.0))
+    pieces = [p for p in pieces if p[1] - p[0] >= 0.05]
+    if not pieces:
+        raise RenderError("usage", "The edits remove the whole recording")
+    return pieces
+
+
+def atempo(rate):
+    parts = []
+    while rate > 2.0:
+        parts.append("atempo=2")
+        rate /= 2.0
+    while rate < 0.5:
+        parts.append("atempo=0.5")
+        rate /= 0.5
+    if abs(rate - 1.0) > 1e-3:
+        parts.append(f"atempo={rate:.4f}")
+    return ",".join(parts) or "anull"
 
 
 def load_events(path):
@@ -413,7 +533,7 @@ def camera_path(cursor, n_frames, fps, w, h, view, segments, fill):
             for ft, fx, fy in seg["focus"]:
                 if 0 <= t - ft < dt and (abs(fx - target[0]) > hw * (1 - DEADZONE) or abs(fy - target[1]) > hh * (1 - DEADZONE)):
                     target = (fx, fy)
-            if pos is not None and (abs(pos[0] - target[0]) > hw * (1 - DEADZONE) or abs(pos[1] - target[1]) > hh * (1 - DEADZONE)):
+            if seg.get("follow", True) and pos is not None and (abs(pos[0] - target[0]) > hw * (1 - DEADZONE) or abs(pos[1] - target[1]) > hh * (1 - DEADZONE)):
                 target = (target[0] + (pos[0] - target[0]) * 0.85, target[1] + (pos[1] - target[1]) * 0.85)
         px, py = pan_x.step(target[0], dt), pan_y.step(target[1], dt)
         # blend from the base view to the pan target as the zoom comes in, so
@@ -810,6 +930,26 @@ def make_mask(path, w, h, radius):
                 "-vf", f"geq=lum='255*clip(0.5-{sdf},0,1)'", "-frames:v", "1", path], "drawing the rounded mask")
 
 
+def make_bubble(path, d, border):
+    """White ring plus soft shadow drawn around a d x d webcam circle; returns the padding."""
+    pad = int(math.ceil(d * 0.12))
+    size = d + 2 * pad
+    c = size / 2
+    r = d / 2
+    rgba = bytearray(size * size * 4)
+    for y in range(size):
+        for x in range(size):
+            dist = math.hypot(x + 0.5 - c, y + 0.5 - c - d * 0.02)
+            shadow = 0.5 * math.exp(-((max(0.0, dist - r) / (d * 0.05)) ** 2))
+            ring = clamp(r + border + 0.5 - math.hypot(x + 0.5 - c, y + 0.5 - c), 0.0, 1.0)
+            a = ring + shadow * (1 - ring)
+            v = int(255 * ring / a) if a > 0 else 0
+            k = (y * size + x) * 4
+            rgba[k:k + 4] = bytes((v, v, v, int(a * 255)))
+    write_png(path, size, size, rgba)
+    return pad
+
+
 # ------------------------------------------------------------------ layout
 
 def canvas_size(fmt, size, w, h):
@@ -900,7 +1040,14 @@ def render(opts):
 
     events_path = opts.events or default_events_path(video)
     have_events = os.path.isfile(events_path)
-    out = os.path.abspath(opts.out or output_path(video, opts))
+    edits_path = opts.edits or sidecar(video, ".edit.json")
+    edits = clean_edits(None if opts.no_edits else load_json(edits_path, "edits"), duration)
+    session = load_json(sidecar(video, ".session.json"), "session") or {}
+    pieces = timeline_pieces(edits, duration)
+    edited = pieces != [(0.0, duration, 1.0)]
+    out_duration = sum((b - a) / r for a, b, r in pieces)
+    plan_only = opts.cmd == "plan"
+    out = os.path.abspath(opts.out or output_path(video, opts)) if not plan_only else None
     if out == video:
         raise RenderError("usage", "--out must differ from the input video")
 
@@ -955,6 +1102,28 @@ def render(opts):
         cursor_scale = sx
     else:
         log(f"No events file ({events_path}); framing only.")
+
+    def seg_json(seg):
+        return {"start": round(seg["start"], 3), "end": round(seg["end"], 3), "zoom": seg["zoom"],
+                "x": round(seg["focus"][0][1] / w, 4), "y": round(seg["focus"][0][2] / h, 4),
+                "follow": seg.get("follow", True)}
+
+    auto_segments = [seg_json(sg) for sg in segments]
+    if edits["zooms"] is not None:
+        segments = [{"start": z["start"], "end": z["end"], "zoom": z["zoom"], "follow": z["follow"],
+                     "focus": [(z["start"], z["x"] * w, z["y"] * h)]}
+                    for z in edits["zooms"] if z["zoom"] > 1.0]
+    cam_path = session.get("webcam")
+    cam_path = os.path.join(os.path.dirname(sidecar(video, "")), os.path.basename(cam_path)) if isinstance(cam_path, str) else None
+    has_webcam = bool(cam_path and os.path.isfile(cam_path))
+    tracks = session.get("audio") if isinstance(session.get("audio"), list) else []
+    split_audio = "system" in tracks and "mic" in tracks and info["audio_tracks"] >= len(tracks)
+    if plan_only:
+        return {"ok": True, "video": video, "duration": duration, "width": src_w, "height": src_h, "fps": src_fps,
+                "audio": info["audio"], "audioTracks": tracks if split_audio else (["mix"] if info["audio"] else []),
+                "webcam": has_webcam, "events": have_events, "autoSegments": auto_segments,
+                "segments": [seg_json(sg) for sg in segments], "edits": edits, "editsFile": edits_path,
+                "outputDuration": out_duration}
 
     camera = camera_path(cursor, n_frames, fps, w, h, view, segments, layout == "fill")
 
@@ -1074,9 +1243,74 @@ def render(opts):
             graph.append(f"[{m}:v]format=gray[mk]")
             graph.append("[c0v][mk]alphamerge[c1v]")
             graph.append(f"[{b}:v]format=yuv420p[bgv]")
-            graph.append(f"[bgv][c1v]overlay={vid_x}:{vid_y}:shortest=1:format=auto,format=yuv420p[out]")
+            graph.append(f"[bgv][c1v]overlay={vid_x}:{vid_y}:shortest=1:format=auto[comp]")
+            next_input += 2
         else:
-            graph.append(f"{src}scale={cw}:{ch}:flags=lanczos,format=yuv420p[out]")
+            graph.append(f"{src}scale={cw}:{ch}:flags=lanczos[comp]")
+        src = "[comp]"
+
+        cam = edits["webcam"]
+        use_webcam = has_webcam and cam["enabled"] and not opts.no_webcam
+        if use_webcam:
+            cam_info = probe(cam_path)
+            # the webcam starts before the screen recorder and stops with it
+            lead = cam_info["duration"] - duration
+            d = even(min(cw, ch) * cam["size"])
+            margin = int(round(min(cw, ch) * 0.045))
+            border = max(2, int(round(d * 0.025)))
+            x = margin if cam["corner"] in ("bl", "tl") else cw - margin - d
+            y = margin if cam["corner"] in ("tl", "tr") else ch - margin - d
+            frame_png, cmask = os.path.join(work, "bubble.png"), os.path.join(work, "bubble-mask.png")
+            fpad = make_bubble(frame_png, d, border)
+            make_mask(cmask, d, d, d / 2)
+            if lead < 0:
+                inputs += ["-itsoffset", f"{-lead:.3f}"]
+            inputs += ["-i", cam_path, "-loop", "1", "-framerate", f"{fps:g}", "-i", frame_png,
+                       "-loop", "1", "-framerate", f"{fps:g}", "-i", cmask]
+            ci, fi, mi = next_input, next_input + 1, next_input + 2
+            next_input += 3
+            trim = f"trim=start={lead:.3f},setpts=PTS-STARTPTS," if lead > 0 else ""
+            graph.append(f"[{ci}:v]{trim}fps={fps:g},{'hflip,' if cam['mirror'] else ''}"
+                         f"scale={d}:{d}:force_original_aspect_ratio=increase,crop={d}:{d},format=yuva420p[cam0]")
+            graph.append(f"[{mi}:v]format=gray[cmk]")
+            graph.append("[cam0][cmk]alphamerge[cam1]")
+            graph.append(f"{src}[{fi}:v]overlay={x - fpad}:{y - fpad}:shortest=1[bub]")
+            graph.append(f"[bub][cam1]overlay={x}:{y}:eof_action=pass[wc]")
+            src = "[wc]"
+
+        vol = edits["audio"]
+        sys_v = opts.system_volume if opts.system_volume is not None else vol["system"]
+        mic_v = opts.mic_volume if opts.mic_volume is not None else vol["mic"]
+        denoise = opts.denoise or vol["denoise"]
+        audio_label = None
+        if info["audio"] and not gif:
+            if split_audio:
+                si, mi_ = tracks.index("system"), tracks.index("mic")
+                graph.append(f"[0:a:{si}]volume={sys_v:.3f}[as]")
+                graph.append(f"[0:a:{mi_}]{'afftdn=nf=-25,' if denoise else ''}volume={mic_v:.3f}[am]")
+                graph.append("[as][am]amix=inputs=2:normalize=0:duration=longest[aud]")
+                audio_label = "[aud]"
+            elif edited or abs(sys_v - 1) > 1e-3 or denoise:
+                graph.append(f"[0:a:0]{'afftdn=nf=-25,' if denoise else ''}volume={sys_v:.3f}[aud]")
+                audio_label = "[aud]"
+        if edited:
+            n = len(pieces)
+            graph.append(f"{src}split={n}" + "".join(f"[pv{i}]" for i in range(n)) if n > 1 else f"{src}null[pv0]")
+            if audio_label:
+                graph.append(f"{audio_label}asplit={n}" + "".join(f"[pa{i}]" for i in range(n)) if n > 1 else f"{audio_label}anull[pa0]")
+            cat = []
+            for i, (a, b, r) in enumerate(pieces):
+                graph.append(f"[pv{i}]trim=start={a:.3f}:end={b:.3f},setpts=(PTS-STARTPTS)/{r:.4f}[qv{i}]")
+                cat.append(f"[qv{i}]")
+                if audio_label:
+                    graph.append(f"[pa{i}]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS,{atempo(r)}[qa{i}]")
+                    cat.append(f"[qa{i}]")
+            graph.append("".join(cat) + f"concat=n={n}:v=1:a={1 if audio_label else 0}[catv]" + ("[cata]" if audio_label else ""))
+            graph.append(f"[catv]fps={fps:g}[ed]")
+            src = "[ed]"
+            if audio_label:
+                audio_label = "[cata]"
+        graph.append(f"{src}format=yuv420p[out]")
 
         script = os.path.join(work, "graph.txt")
         with open(script, "w") as f:
@@ -1084,9 +1318,11 @@ def render(opts):
 
         head_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-y"]
         tail = ["-map", "[out]"]
-        if info["audio"] and not gif:
-            tail += ["-map", "0:a?", "-c:a", "copy"]
-        tail += ["-r", f"{fps:g}", "-t", f"{duration:.3f}"]
+        if audio_label:
+            tail += ["-map", audio_label, "-c:a", "aac", "-b:a", "192k"]
+        elif info["audio"] and not gif:
+            tail += ["-map", "0:a:0", "-c:a", "copy"]
+        tail += ["-r", f"{fps:g}", "-t", f"{out_duration:.3f}"]
         if gif:
             mid = os.path.join(work, "gif-source.mp4")
             tmp_out = mid
@@ -1109,7 +1345,7 @@ def render(opts):
                 f.write(";\n".join(graph[:-1] + [graph[-1].replace("format=yuv420p[out]", "format=nv12,hwupload[out]")]))
             qp = "28" if preview else str(max(10, opts.crf + 2))
             err = encode(head_cmd + ["-vaapi_device", device] + inputs, vgraph,
-                         tail + ["-c:v", "h264_vaapi", "-qp", qp], tmp_out, duration, span)
+                         tail + ["-c:v", "h264_vaapi", "-qp", qp], tmp_out, out_duration, span)
             if err:
                 if opts.encoder == "vaapi":
                     raise RenderError("ffmpeg_failed", f"VAAPI encode failed: {err}")
@@ -1117,7 +1353,7 @@ def render(opts):
                 encoder = "x264"
                 err = None
         if encoder == "x264" or gif:
-            err = encode(head_cmd + inputs, script, tail + x264_args(), tmp_out, duration, span)
+            err = encode(head_cmd + inputs, script, tail + x264_args(), tmp_out, out_duration, span)
         if err:
             raise RenderError("ffmpeg_failed", f"ffmpeg failed while rendering: {err}")
 
@@ -1140,9 +1376,9 @@ def render(opts):
             os.replace(tmp_out, out)
         if not JSON_MODE:
             print("\r100%", file=sys.stderr)
-        seg_out = [{"start": round(s["start"], 3), "end": round(s["end"], 3), "zoom": s["zoom"],
-                    "x": round(s["focus"][0][1] / w, 4), "y": round(s["focus"][0][2] / h, 4)} for s in segments]
-        return {"ok": True, "file": out, "duration": duration, "zooms": len(segments), "segments": seg_out,
+        seg_out = [seg_json(sg) for sg in segments]
+        return {"ok": True, "file": out, "duration": out_duration, "zooms": len(segments), "segments": seg_out,
+                "edited": edited, "webcam": use_webcam, "audioMix": bool(audio_label),
                 "cursor": draw_cursor, "encoder": "gif" if gif else encoder,
                 "format": opts.format, "layout": layout, "size": [cw, ch],
                 "events": events_path if have_events else None}
@@ -1161,8 +1397,15 @@ def main():
     global JSON_MODE
     parser = argparse.ArgumentParser(prog="creator-mode-studio", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("render", help="render the studio cut of a recording")
+    common = argparse.ArgumentParser(add_help=False)
+    r = common
     r.add_argument("video")
+    r.add_argument("--edits", help="timeline edits (default: .creator-mode/<name>.edit.json when it exists)")
+    r.add_argument("--no-edits", action="store_true", help="ignore the edit file")
+    r.add_argument("--no-webcam", action="store_true", help="leave out the webcam bubble")
+    r.add_argument("--system-volume", type=float, help="desktop audio gain (default from edits, else 1)")
+    r.add_argument("--mic-volume", type=float, help="microphone gain, for recordings with a separate mic track")
+    r.add_argument("--denoise", action="store_true", help="reduce background noise on the microphone")
     r.add_argument("--events", help="events file (default: next to the video in .creator-mode/)")
     r.add_argument("--out", help="output file (default: <video>-studio[-FORMAT][-preview].mp4|gif)")
     r.add_argument("--zoom", type=float, default=1.8, help="zoom level on clicks; 1 disables zoom (default 1.8)")
@@ -1193,6 +1436,8 @@ def main():
     r.add_argument("--crf", type=int, default=18, help="x264 quality, lower is better (default 18)")
     r.add_argument("--json-progress", action="store_true", help="machine-readable progress on stdout")
     r.add_argument("--keep-temp", action="store_true", help=argparse.SUPPRESS)
+    sub.add_parser("render", parents=[common], help="render the studio cut of a recording")
+    sub.add_parser("plan", parents=[common], help="print the zoom plan and edits as JSON without rendering")
     opts = parser.parse_args()
     JSON_MODE = opts.json_progress
     signal.signal(signal.SIGTERM, interrupted)
@@ -1207,8 +1452,8 @@ def main():
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)
-    if JSON_MODE:
-        emit(result)
+    if JSON_MODE or opts.cmd == "plan":
+        print(json.dumps(result), flush=True)
     else:
         print(result["file"])
 

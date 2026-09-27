@@ -37,8 +37,37 @@ After you stop, `bin/creator-mode-studio` renders `<name>-studio.mp4` next to th
 - **Speed:** `--quality preview` renders at half size, 30 fps, without motion blur (~8× faster).
   `--encoder auto` (default) uses VAAPI (`h264_vaapi`) when a test encode on `/dev/dri/renderD*` works,
   otherwise libx264; `--encoder vaapi|x264` forces one.
-- Audio is copied untouched (not in GIFs). The raw recording is never modified; a failed or skipped render
-  (`Esc`) still leaves it saved.
+- Audio is copied untouched (not in GIFs) unless you change levels or edit the timeline. The raw recording
+  is never modified; a failed or skipped render (`Esc`) still leaves it saved.
+
+### Timeline editor
+
+`E` on the saved screen (or `creator-mode-rec edit <file>`) opens a local editor in your browser
+(`bin/creator-mode-editor`, served on `127.0.0.1` behind a random token, standard library only). It shows
+the raw recording with a filmstrip and three tracks:
+
+- **Trim** with the filmstrip handles or `I`/`O` at the playhead.
+- **Cut** (`X`) or **speed up** (`S`, 1.5–8×, or 0.5× slow-mo) a range you drag across the filmstrip.
+- **Zooms:** the automatic zooms are shown dashed. Drag to move, drag the edges to resize, change the level,
+  click the video to choose where it zooms, turn cursor-follow on/off, `Del` to remove, `Z` to add one.
+  *Auto zooms* goes back to the automatic ones and *No zooms* removes them all.
+- **Audio:** desktop and mic levels (separate when recorded with Studio + desktop+mic) and noise reduction.
+- **Webcam:** show/hide the bubble, corner, size, mirror.
+- Background, format and GIF/MP4 export, then *Quick preview* or *Render*; the result plays in the page.
+
+Playback in the editor skips cuts, plays sped-up ranges faster and previews the zooms. Edits are saved as
+you go to `.creator-mode/<name>.edit.json`; every later render (including `creator-mode-studio render`)
+applies them. `--no-edits` ignores the file and `creator-mode-studio plan <file>` prints the zoom plan and
+the edits as JSON.
+
+### Webcam and audio
+
+With Studio on, `W` in the panel turns on the **webcam bubble**. `ffmpeg` records `/dev/video0` next to
+the screen (`.creator-mode/<name>.webcam.mkv`) and the render puts it in a round, bordered bubble in a
+corner (bottom right, 24% of the short side by default). Set `CREATOR_MODE_WEBCAM_DEVICE` to use
+another camera. With Studio on and `desktop+mic` audio, the recording gets three tracks: the usual mix
+(what players play), desktop only and mic only. That way the studio render and the editor can set
+`--system-volume`, `--mic-volume` and `--denoise` separately.
 
 Without access to `/dev/input` (you're not in the `input` group), clicks can't be seen and zooms follow
 where the cursor comes to rest instead. For click-accurate zooms: `sudo usermod -aG input $USER` and log in
@@ -109,12 +138,12 @@ Keys:
 
 | State | Keys |
 | --- | --- |
-| idle | `Enter`/`Space`/`R` full screen · `P` pick area/window/monitor, then countdown · `A` cycle audio (none → desktop → desktop+mic) · `S` studio on/off · `B` cycle background · `F` cycle format (source → 16:9 → 9:16 → 1:1) · `Esc`/`Q` close |
+| idle | `Enter`/`Space`/`R` full screen · `P` pick area/window/monitor, then countdown · `A` cycle audio (none → desktop → desktop+mic) · `S` studio on/off · `B` cycle background · `F` cycle format (source → 16:9 → 9:16 → 1:1 → 4:5) · `W` webcam bubble (studio on, camera found) · `Esc`/`Q` close |
 | picking | Omarchy's picker keys: drag an area, click a window, `Enter` highlighted window, `Ctrl + Enter` whole monitor, `Esc` cancels back to idle |
 | countdown | `Esc` or the hotkey cancels |
 | recording | hotkey (`SUPER + ALT + R`) stops |
 | rendering | `Esc` skips the studio cut (raw recording stays saved) |
-| saved | `O` open folder · `Enter` new recording · `Esc` done |
+| saved | `O` open folder · `E` edit timeline · `Enter` new recording · `Esc` done |
 | error | `Enter` retry · `Esc` close |
 
 ## Dependencies
@@ -251,9 +280,10 @@ Run on the Omarchy desktop after `./install.sh`.
 ```bash
 bash -n bin/creator-mode-rec
 shellcheck -x bin/creator-mode-rec install.sh uninstall.sh test/*.sh test/fake-recorder test/stand-in-recorder
-python3 -m py_compile bin/creator-mode-track bin/creator-mode-studio
+python3 -m py_compile bin/creator-mode-track bin/creator-mode-studio bin/creator-mode-editor
 ./test/controller-test.sh        # needs ffmpeg/ffprobe + flock; fake recorder + fake Hyprland socket
 ./test/studio-test.sh            # renders a synthetic clip with every format/export option
+./test/editor-test.sh            # timeline edits, webcam, split audio, and the editor's HTTP API
 ```
 
 Environment overrides (for testing only): `CREATOR_MODE_RECORDER`, `CREATOR_MODE_MONITOR`,

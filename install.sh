@@ -50,9 +50,9 @@ was_installed=false
 mkdir -p "$PLUGINS_DIR"
 stage=$(mktemp -d "$PLUGINS_DIR/.creator-mode.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
-install -m 644 "$SRC/manifest.json" "$SRC/CreatorMode.qml" "$stage/"
+install -m 644 "$SRC/manifest.json" "$SRC/CreatorMode.qml" "$SRC/editor.html" "$stage/"
 install -d "$stage/bin"
-install -m 755 "$SRC/bin/creator-mode-rec" "$SRC/bin/creator-mode-track" "$SRC/bin/creator-mode-studio" "$stage/bin/"
+install -m 755 "$SRC/bin/creator-mode-rec" "$SRC/bin/creator-mode-track" "$SRC/bin/creator-mode-studio" "$SRC/bin/creator-mode-editor" "$stage/bin/"
 omarchy-plugin-validate "$stage" >/dev/null || die "plugin failed Omarchy's manifest validation"
 
 rm -rf "$DEST"

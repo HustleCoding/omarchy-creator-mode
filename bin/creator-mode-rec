@@ -5,7 +5,7 @@
 #   creator-mode-rec check                       dependencies + output dir
 #   creator-mode-rec status                      idle | recording | crashed
 #   creator-mode-rec pick                        Omarchy's region/window/monitor picker
-#   creator-mode-rec start [--audio=MODE] [--target=TARGET] [--studio=on|off]
+#   creator-mode-rec start [--audio=MODE] [--target=TARGET] [--studio=on|off] [--webcam=on|off]
 #                                                MODE: none | desktop | desktop+mic
 #                                                TARGET: focused | monitor:NAME | region:WxH+X+Y
 #                                                studio: also log the cursor/clicks for
@@ -14,6 +14,7 @@
 #   creator-mode-rec render <file> [--background=BG] [--zoom=N] [--format=F] [--quality=Q] [--export=mp4|gif]
 #                                                studio cut: auto-zoom, smooth cursor, frame;
 #                                                streams {"progress":0..1} lines, then the result
+#   creator-mode-rec edit <file>                 open the timeline editor in the browser
 #   creator-mode-rec reveal <file>               open the folder containing <file>
 #
 # Every command prints exactly one JSON object on stdout. Failures also exit
@@ -36,6 +37,10 @@ BIN_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 TRACKER="${CREATOR_MODE_TRACKER:-$BIN_DIR/creator-mode-track}"
 STUDIO="${CREATOR_MODE_STUDIO:-$BIN_DIR/creator-mode-studio}"
 TRACKER_LOG="$STATE_DIR/tracker.log"
+EDITOR_BIN="${CREATOR_MODE_EDITOR:-$BIN_DIR/creator-mode-editor}"
+WEBCAM_DEVICE="${CREATOR_MODE_WEBCAM_DEVICE:-/dev/video0}"
+WEBCAM_FORMAT="${CREATOR_MODE_WEBCAM_FORMAT:-v4l2}"
+WEBCAM_LOG="$STATE_DIR/webcam.log"
 
 json_str() {
   local s
@@ -115,12 +120,16 @@ load_state() {
   STARTED=""
   TRACKER_PID=""
   EVENTS=""
+  WEBCAM_PID=""
+  WEBCAM=""
   [[ -f $STATE_FILE ]] || return 1
   PID=$(sed -n 's/^pid=//p' "$STATE_FILE")
   FILE=$(sed -n 's/^file=//p' "$STATE_FILE")
   STARTED=$(sed -n 's/^started=//p' "$STATE_FILE")
   TRACKER_PID=$(sed -n 's/^tracker_pid=//p' "$STATE_FILE")
   EVENTS=$(sed -n 's/^events=//p' "$STATE_FILE")
+  WEBCAM_PID=$(sed -n 's/^webcam_pid=//p' "$STATE_FILE")
+  WEBCAM=$(sed -n 's/^webcam=//p' "$STATE_FILE")
   [[ $PID =~ ^[0-9]+$ && -n $FILE ]]
 }
 
@@ -149,6 +158,28 @@ stop_tracker() {
   done
   tracker_alive && kill -KILL "$TRACKER_PID" 2>/dev/null
   return 0
+}
+
+# The webcam recorder is an ffmpeg writing WEBCAM; SIGINT lets it finish the file.
+webcam_alive() {
+  [[ ${WEBCAM_PID:-} =~ ^[0-9]+$ && -n ${WEBCAM:-} && -r /proc/$WEBCAM_PID/cmdline ]] || return 1
+  tr '\0' '\n' <"/proc/$WEBCAM_PID/cmdline" 2>/dev/null | grep -qxF -- "$WEBCAM"
+}
+
+stop_webcam() {
+  webcam_alive || return 0
+  kill -INT "$WEBCAM_PID" 2>/dev/null
+  local waited=0
+  while webcam_alive && ((waited < 40)); do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  webcam_alive && kill -KILL "$WEBCAM_PID" 2>/dev/null
+  return 0
+}
+
+webcam_available() {
+  [[ $WEBCAM_FORMAT != v4l2 || -c $WEBCAM_DEVICE ]] && command -v ffmpeg >/dev/null 2>&1
 }
 
 studio_available() {
@@ -230,8 +261,8 @@ cmd_check() {
     fail "missing_dependency" "Missing: $missing. Install with: sudo pacman -S ${pkgs[*]}"
   fi
   dir=$(ensure_output_dir) || exit 1
-  printf '{"ok":true,"outputDir":%s,"recorder":%s,"studio":%s}\n' "$(json_str "$dir")" "$(json_str "$RECORDER")" \
-    "$(studio_available && echo true || echo false)"
+  printf '{"ok":true,"outputDir":%s,"recorder":%s,"studio":%s,"webcam":%s}\n' "$(json_str "$dir")" "$(json_str "$RECORDER")" \
+    "$(studio_available && echo true || echo false)" "$(webcam_available && echo true || echo false)"
 }
 
 cmd_status() {
@@ -273,17 +304,19 @@ cmd_pick() {
 }
 
 cmd_start() {
-  local audio="none" target="focused" studio="off" arg
+  local audio="none" target="focused" studio="off" webcam="off" arg
   for arg in "$@"; do
     case $arg in
     --audio=*) audio=${arg#*=} ;;
     --target=*) target=${arg#*=} ;;
     --studio=*) studio=${arg#*=} ;;
+    --webcam=*) webcam=${arg#*=} ;;
     *) fail "usage" "Unknown option: $arg" ;;
     esac
   done
   case $audio in none | desktop | desktop+mic) ;; *) fail "usage" "Unknown audio mode: $audio" ;; esac
   case $studio in on | off) ;; *) fail "usage" "Unknown studio mode: $studio" ;; esac
+  case $webcam in on | off) ;; *) fail "usage" "Unknown webcam mode: $webcam" ;; esac
   [[ $target == "focused" || $target =~ ^monitor:[A-Za-z0-9._-]+$ || $target =~ ^region:[0-9]+x[0-9]+\+-?[0-9]+\+-?[0-9]+$ ]] ||
     fail "usage" "Unknown capture target: $target"
 
@@ -362,6 +395,41 @@ cmd_start() {
     fi
   fi
 
+  # Studio also keeps desktop and mic as separate tracks (after the mixed one
+  # players use) so the editor can balance them.
+  local audio_tracks=""
+  if [[ $studio == "on" && $audio == "desktop+mic" ]] && studio_available && mkdir -p "$dir/.creator-mode" 2>/dev/null; then
+    audio_args=(-a "default_output|default_input" -a "default_output" -a "default_input" -ac aac)
+    audio_tracks='"mix","system","mic"'
+  elif [[ $audio != none ]]; then
+    audio_tracks='"mix"'
+  fi
+
+  local webcam_pid="" webcam_file=""
+  if [[ $webcam == "on" ]]; then
+    if [[ $studio != "on" ]] || ! studio_available; then
+      studio_note="${studio_note:+$studio_note }The webcam bubble needs Studio on."
+    elif ! webcam_available; then
+      studio_note="${studio_note:+$studio_note }No webcam found at $WEBCAM_DEVICE."
+    elif mkdir -p "$dir/.creator-mode" 2>/dev/null; then
+      webcam_file="$dir/.creator-mode/$(basename "${file%.mp4}").webcam.mkv"
+      : >"$WEBCAM_LOG"
+      setsid ffmpeg -hide_banner -loglevel error -nostdin -f "$WEBCAM_FORMAT" -i "$WEBCAM_DEVICE" -an \
+        -c:v libx264 -preset ultrafast -crf 23 -g 60 -y "$webcam_file" </dev/null >>"$WEBCAM_LOG" 2>&1 9>&- &
+      webcam_pid=$!
+      sleep 0.3
+      if ! kill -0 "$webcam_pid" 2>/dev/null; then
+        studio_note="${studio_note:+$studio_note }Webcam failed: $(tail -n1 "$WEBCAM_LOG" | cut -c1-160)"
+        webcam_pid="" webcam_file=""
+      fi
+    fi
+  fi
+  if [[ $studio == "on" && -d $dir/.creator-mode ]]; then
+    printf '{"audio":[%s],"webcam":%s}\n' "$audio_tracks" \
+      "$([[ -n $webcam_file ]] && json_str "$(basename "$webcam_file")" || echo null)" \
+      >"$dir/.creator-mode/$(basename "${file%.mp4}").session.json"
+  fi
+
   : >"$LOG_FILE"
   # setsid detaches the recorder from the shell process so restarting
   # omarchy-shell (or closing the panel) never interrupts a recording; 9>&- keeps
@@ -376,11 +444,15 @@ cmd_start() {
     sleep 0.1
   done
 
-  TRACKER_PID=$tracker_pid EVENTS=$events
+  TRACKER_PID=$tracker_pid EVENTS=$events WEBCAM_PID=$webcam_pid WEBCAM=$webcam_file
+  local session
+  session="$dir/.creator-mode/$(basename "${file%.mp4}").session.json"
   if ! kill -0 "$pid" 2>/dev/null; then
     wait "$pid" 2>/dev/null
     local code=$?
     stop_tracker
+    stop_webcam
+    rm -f "$session" ${webcam_file:+"$webcam_file"}
     [[ -n $events ]] && rm -f "$events"
     rm -f "$file"
     local detail
@@ -393,6 +465,8 @@ cmd_start() {
     sleep 1
     kill -KILL "$pid" 2>/dev/null
     stop_tracker
+    stop_webcam
+    rm -f "$session" ${webcam_file:+"$webcam_file"}
     [[ -n $events ]] && rm -f "$events"
     rm -f "$file"
     fail "start_timeout" "The recorder didn't start writing within ${START_TIMEOUT}s." ",\"log\":$(json_str "$LOG_FILE")"
@@ -400,13 +474,14 @@ cmd_start() {
 
   local started
   started=$(now_ms)
-  printf 'pid=%s\nfile=%s\nstarted=%s\naudio=%s\ntarget=%s\ntracker_pid=%s\nevents=%s\n' \
-    "$pid" "$file" "$started" "$audio" "$target" "$tracker_pid" "$events" >"$STATE_FILE.tmp"
+  printf 'pid=%s\nfile=%s\nstarted=%s\naudio=%s\ntarget=%s\ntracker_pid=%s\nevents=%s\nwebcam_pid=%s\nwebcam=%s\n' \
+    "$pid" "$file" "$started" "$audio" "$target" "$tracker_pid" "$events" "$webcam_pid" "$webcam_file" >"$STATE_FILE.tmp"
   mv "$STATE_FILE.tmp" "$STATE_FILE"
   refresh_omarchy_indicator
 
-  printf '{"ok":true,"state":"recording","pid":%s,"file":%s,"startedAt":%s,"studio":%s,"notice":%s}\n' \
-    "$pid" "$(json_str "$file")" "$started" "$([[ -n $events ]] && echo true || echo false)" "$(json_str "$studio_note")"
+  printf '{"ok":true,"state":"recording","pid":%s,"file":%s,"startedAt":%s,"studio":%s,"webcam":%s,"notice":%s}\n' \
+    "$pid" "$(json_str "$file")" "$started" "$([[ -n $events ]] && echo true || echo false)" \
+    "$([[ -n $webcam_file ]] && echo true || echo false)" "$(json_str "$studio_note")"
 }
 
 cmd_stop() {
@@ -416,6 +491,7 @@ cmd_stop() {
   if is_ours_alive; then
     kill -INT "$PID" 2>/dev/null
     stop_tracker
+    stop_webcam
     local waited=0 limit=$((STOP_TIMEOUT * 10))
     while is_ours_alive && ((waited < limit)); do
       sleep 0.1
@@ -424,6 +500,7 @@ cmd_stop() {
     if is_ours_alive; then
       kill -KILL "$PID" 2>/dev/null
       stop_tracker
+      stop_webcam
       rm -f "$STATE_FILE"
       refresh_omarchy_indicator
       fail "save_timeout" "The recorder didn't finish saving within ${STOP_TIMEOUT}s and was force-stopped. The file may be incomplete." ",\"file\":$(json_str "$FILE")"
@@ -433,6 +510,7 @@ cmd_stop() {
     CRASHED=true
   fi
   stop_tracker
+  stop_webcam
 
   rm -f "$STATE_FILE"
   refresh_omarchy_indicator
@@ -448,11 +526,12 @@ cmd_stop() {
   fi
   size=$(stat -c %s "$FILE")
 
-  local events_json=null
+  local events_json=null webcam_json=null
   [[ -n $EVENTS && -s $EVENTS ]] && events_json=$(json_str "$EVENTS")
+  [[ -n $WEBCAM && -s $WEBCAM ]] && webcam_json=$(json_str "$WEBCAM")
 
-  printf '{"ok":true,"state":"saved","file":%s,"dir":%s,"duration":%s,"size":%s,"recovered":%s,"events":%s}\n' \
-    "$(json_str "$FILE")" "$(json_str "$(dirname "$FILE")")" "$duration" "$size" "$CRASHED" "$events_json"
+  printf '{"ok":true,"state":"saved","file":%s,"dir":%s,"duration":%s,"size":%s,"recovered":%s,"events":%s,"webcam":%s}\n' \
+    "$(json_str "$FILE")" "$(json_str "$(dirname "$FILE")")" "$duration" "$size" "$CRASHED" "$events_json" "$webcam_json"
 }
 
 # Progress lines are passed through from creator-mode-studio; the last line is
@@ -474,6 +553,25 @@ cmd_render() {
   [[ $zoom =~ ^[0-9]+(\.[0-9]+)?$ ]] || fail "usage" "Zoom must be a number: $zoom"
   studio_available || fail "missing_dependency" "Studio needs python3 and ffmpeg. Install with: sudo pacman -S python ffmpeg"
   exec python3 "$STUDIO" render "$file" --background="$background" --zoom="$zoom" "${extra[@]}" --json-progress 9>&-
+}
+
+# Starts the editor detached (it outlives the panel) and returns its URL.
+cmd_edit() {
+  local file=${1:-} out line
+  [[ -n $file ]] || fail "usage" "edit needs a file path"
+  [[ -f $file ]] || fail "not_found" "Recording no longer exists: $file"
+  studio_available && [[ -x $EDITOR_BIN ]] || fail "missing_dependency" "The editor needs python3 and ffmpeg. Install with: sudo pacman -S python ffmpeg"
+  mkdir -p "$STATE_DIR" || fail "state_dir" "Can't create $STATE_DIR"
+  out="$STATE_DIR/editor.out"
+  : >"$out"
+  setsid python3 "$EDITOR_BIN" "$file" ${CREATOR_MODE_EDITOR_NO_OPEN:+--no-open} </dev/null >"$out" 2>&1 9>&- &
+  for _ in $(seq 150); do
+    line=$(head -n1 "$out")
+    [[ -n $line ]] && break
+    sleep 0.1
+  done
+  [[ $line == "{"* ]] || fail "editor_failed" "The editor didn't start: ${line:-no output}"
+  printf '%s\n' "$line"
 }
 
 cmd_reveal() {
@@ -502,6 +600,7 @@ pick) cmd_pick ;;
 start) shift; cmd_start "$@" ;;
 stop) cmd_stop ;;
 render) shift; cmd_render "$@" ;;
+edit) shift; cmd_edit "$@" ;;
 reveal) shift; cmd_reveal "$@" ;;
-*) fail "usage" "Usage: creator-mode-rec check|status|pick|start [--audio=none|desktop|desktop+mic] [--target=focused|monitor:NAME|region:WxH+X+Y] [--studio=on|off]|stop|render <file> [--background=BG] [--zoom=N] [--format=F] [--quality=Q] [--export=mp4|gif]|reveal <file>" ;;
+*) fail "usage" "Usage: creator-mode-rec check|status|pick|start [--audio=none|desktop|desktop+mic] [--target=focused|monitor:NAME|region:WxH+X+Y] [--studio=on|off] [--webcam=on|off]|stop|render <file> [--background=BG] [--zoom=N] [--format=F] [--quality=Q] [--export=mp4|gif]|edit <file>|reveal <file>" ;;
 esac

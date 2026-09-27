@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""creator-mode-editor: local timeline editor for a Creator Mode recording.
+
+    creator-mode-editor VIDEO [--port N] [--no-open]
+
+Serves a single-page editor on 127.0.0.1 behind a random token, opens it in
+the browser and exits when the page is closed (or after 30 idle minutes).
+Edits (trim, cuts, speed-ups, zooms, audio levels, webcam bubble) are saved
+to <video dir>/.creator-mode/<name>.edit.json; creator-mode-studio applies
+them on every render. The raw recording is only ever read.
+
+Prints one JSON line on start: {"ok":true,"url":"http://127.0.0.1:PORT/TOKEN/"}
+"""
+
+import argparse
+import json
+import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+STUDIO = os.environ.get("CREATOR_MODE_STUDIO") or os.path.join(HERE, "creator-mode-studio")
+PAGE = os.environ.get("CREATOR_MODE_EDITOR_PAGE") or os.path.join(HERE, "..", "editor.html")
+IDLE_LIMIT = 30 * 60
+THEME_COLORS = os.path.expanduser("~/.local/state/omarchy/current/theme/colors.toml")
+RENDER_CHOICES = {
+    "quality": ("final", "preview"),
+    "format": ("source", "16:9", "9:16", "1:1", "4:5"),
+    "export": ("mp4", "gif"),
+    "encoder": ("auto", "x264", "vaapi"),
+}
+BACKGROUND = re.compile(r"theme|wallpaper|[a-z]{2,12}|#[0-9a-fA-F]{6}(:#[0-9a-fA-F]{6})?")
+
+
+def studio(*args):
+    proc = subprocess.run([sys.executable, STUDIO, *args], capture_output=True, text=True)
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"ok": False, "error": "studio_failed", "message": (proc.stderr or proc.stdout).strip()[-400:]}
+
+
+def theme():
+    try:
+        with open(THEME_COLORS) as f:
+            return dict(re.findall(r'^\s*(\w+)\s*=\s*"(#[0-9a-fA-F]{6})"', f.read(), re.M))
+    except OSError:
+        return {}
+
+
+class Job:
+    """At most one render at a time; progress is polled by the page."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+        self.progress = 0.0
+        self.result = None
+
+    def start(self, video, choices):
+        with self.lock:
+            if self.proc and self.proc.poll() is None:
+                return False
+            args = [sys.executable, STUDIO, "render", video, "--json-progress"]
+            args += [f"--{k}={v}" for k, v in choices.items()]
+            self.progress, self.result = 0.0, None
+            self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
+            return True
+
+    def _read(self, proc):
+        last = None
+        for line in proc.stdout:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if "progress" in msg:
+                self.progress = msg["progress"]
+            else:
+                last = msg
+        proc.wait()
+        with self.lock:
+            if proc is self.proc:
+                self.result = last or {"ok": False, "error": "cancelled" if proc.returncode in (-15, 130) else "failed",
+                                       "message": "Render stopped" if proc.returncode in (-15, 130) else "Render failed"}
+
+    def cancel(self):
+        with self.lock:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+
+    def state(self):
+        running = bool(self.proc and self.proc.poll() is None)
+        return {"running": running, "progress": self.progress, "result": None if running else self.result}
+
+
+def make_handler(ctx):
+    token = ctx["token"]
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "creator-mode-editor"
+
+        def log_message(self, *_):
+            pass
+
+        def route(self):
+            ctx["seen"] = time.monotonic()
+            prefix = f"/{token}/"
+            path = self.path.split("?", 1)[0]
+            if not path.startswith(prefix):
+                self.send_error(404)
+                return None
+            return path[len(prefix):]
+
+        def send_json(self, obj, code=200):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def send_file(self, path, ctype):
+            try:
+                size = os.path.getsize(path)
+                f = open(path, "rb")
+            except OSError:
+                self.send_error(404)
+                return
+            with f:
+                start, end = 0, size - 1
+                m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+                if m and (m.group(1) or m.group(2)):
+                    if m.group(1):
+                        start = int(m.group(1))
+                        end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+                    else:
+                        start = max(0, size - int(m.group(2)))
+                    if start > end:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.end_headers()
+                        return
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                else:
+                    self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(end - start + 1))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                f.seek(start)
+                left = end - start + 1
+                try:
+                    while left > 0:
+                        chunk = f.read(min(left, 1 << 16))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        left -= len(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        def body(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 1 << 20:
+                raise ValueError("too large")
+            data = json.loads(self.rfile.read(n) or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError("expected an object")
+            return data
+
+        def do_GET(self):
+            name = self.route()
+            if name is None:
+                return
+            if name == "":
+                self.send_file(PAGE, "text/html; charset=utf-8")
+            elif name == "video":
+                self.send_file(ctx["video"], "video/mp4")
+            elif name == "thumbs.jpg":
+                self.send_file(ctx["thumbs"], "image/jpeg")
+            elif name == "state":
+                plan = studio("plan", ctx["video"])
+                plan["theme"] = theme()
+                plan["name"] = os.path.basename(ctx["video"])
+                self.send_json(plan, 200 if plan.get("ok") else 500)
+            elif name == "progress":
+                self.send_json(ctx["job"].state())
+            elif name == "output":
+                res = ctx["job"].state()["result"] or {}
+                out = res.get("file")
+                if res.get("ok") and out:
+                    self.send_file(out, "image/gif" if out.endswith(".gif") else "video/mp4")
+                else:
+                    self.send_error(404)
+            else:
+                self.send_error(404)
+
+        def do_POST(self):
+            name = self.route()
+            if name is None:
+                return
+            if self.headers.get("Origin") not in (None, ctx["origin"]):
+                self.send_error(403)
+                return
+            try:
+                data = self.body()
+            except ValueError as e:
+                self.send_json({"ok": False, "message": str(e)}, 400)
+                return
+            if name == "edits":
+                edits_path = ctx["edits"]
+                os.makedirs(os.path.dirname(edits_path), exist_ok=True)
+                fd, tmp = tempfile.mkstemp(dir=os.path.dirname(edits_path), prefix=".edit.")
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f, indent=1)
+                os.replace(tmp, edits_path)
+                # read back through the renderer so the page sees the clamped values
+                plan = studio("plan", ctx["video"])
+                self.send_json(plan, 200 if plan.get("ok") else 400)
+            elif name == "render":
+                choices = {}
+                for key, allowed in RENDER_CHOICES.items():
+                    if data.get(key) in allowed:
+                        choices[key] = data[key]
+                bg = data.get("background")
+                if isinstance(bg, str) and BACKGROUND.fullmatch(bg):
+                    choices["background"] = bg
+                ok = ctx["job"].start(ctx["video"], choices)
+                self.send_json({"ok": ok, "message": None if ok else "A render is already running"}, 200 if ok else 409)
+            elif name == "cancel":
+                ctx["job"].cancel()
+                self.send_json({"ok": True})
+            elif name == "quit":
+                self.send_json({"ok": True})
+                ctx["quit"].set()
+            else:
+                self.send_error(404)
+
+    return Handler
+
+
+def make_thumbs(video, out, duration):
+    n = 24
+    rate = n / max(duration, 0.1)
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", video,
+                    "-vf", f"fps={rate:.5f},scale=160:90:force_original_aspect_ratio=decrease,"
+                           f"pad=160:90:(ow-iw)/2:(oh-ih)/2,tile={n}x1",
+                    "-frames:v", "1", "-q:v", "4", out], capture_output=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="creator-mode-editor", description=__doc__.split("\n\n")[0])
+    parser.add_argument("video")
+    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--no-open", action="store_true", help="print the URL instead of opening a browser")
+    opts = parser.parse_args()
+    video = os.path.abspath(opts.video)
+    plan = studio("plan", video)
+    if not plan.get("ok"):
+        print(json.dumps(plan), flush=True)
+        return 1
+    work = tempfile.mkdtemp(prefix="creator-mode-editor-", dir=os.environ.get("XDG_RUNTIME_DIR") or None)
+    thumbs = os.path.join(work, "thumbs.jpg")
+    make_thumbs(video, thumbs, plan["duration"])
+    ctx = {"video": video, "edits": plan["editsFile"], "thumbs": thumbs, "token": secrets.token_urlsafe(18),
+           "job": Job(), "quit": threading.Event(), "seen": time.monotonic()}
+    server = ThreadingHTTPServer(("127.0.0.1", opts.port), make_handler(ctx))
+    server.daemon_threads = True
+    port = server.server_address[1]
+    ctx["origin"] = f"http://127.0.0.1:{port}"
+    url = f"{ctx['origin']}/{ctx['token']}/"
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    signal.signal(signal.SIGTERM, lambda *_: ctx["quit"].set())
+    signal.signal(signal.SIGHUP, lambda *_: ctx["quit"].set())
+    print(json.dumps({"ok": True, "url": url, "pid": os.getpid()}), flush=True)
+    if not opts.no_open:
+        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        while not ctx["quit"].wait(5):
+            if time.monotonic() - ctx["seen"] > IDLE_LIMIT and not ctx["job"].state()["running"]:
+                break
+    except KeyboardInterrupt:
+        pass
+    ctx["job"].cancel()
+    server.shutdown()
+    for f in os.listdir(work):
+        os.remove(os.path.join(work, f))
+    os.rmdir(work)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
