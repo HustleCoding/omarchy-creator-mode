@@ -1,4 +1,5 @@
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Wayland
 import QtQuick
@@ -31,6 +32,8 @@ Item {
 
   property string captureTarget: "focused"
   property string captureLabel: "Full screen · focused monitor"
+  // Resolved by the controller once recording starts: monitor:NAME or region:WxH+X+Y.
+  property string recordedTarget: ""
 
   property string outputDir: ""
   property string recordingFile: ""
@@ -44,7 +47,16 @@ Item {
   property bool foreignRecording: false
 
   readonly property bool cardVisible: opened && ["idle", "countdown", "saved", "error"].indexOf(phase) !== -1
-  readonly property bool pillVisible: ["starting", "recording", "saving"].indexOf(phase) !== -1
+  readonly property bool pillVisible: ["recording", "saving"].indexOf(phase) !== -1
+
+  // The REC pill must never end up in the video, so it only goes where the
+  // recorder isn't looking: another monitor, or the top of a monitor whose
+  // top-center area lies outside the recorded region. Otherwise it stays hidden.
+  readonly property var pillScreen: indicatorScreen(recordedTarget, Quickshell.screens)
+  readonly property string pendingTarget: captureTarget === "focused"
+    ? (Hyprland.focusedMonitor ? "monitor:" + Hyprland.focusedMonitor.name : "")
+    : captureTarget
+  readonly property bool pillWillHide: indicatorScreen(pendingTarget, Quickshell.screens) === null
 
   // Theme
   readonly property string fontFamily: Style.font.menuFamily
@@ -58,6 +70,40 @@ Item {
   readonly property int pad: Math.max(Style.spacing.panelPadding, Style.space(28))
   readonly property var cardBorder: Border.surfaceSpec("menu", "border",
     phase === "error" ? danger : Color.menu.border, Math.max(1, Style.space(2)))
+
+  // ------------------------------------------------------ indicator placement
+
+  function parseRegion(target) {
+    var m = /^region:(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$/.exec(target)
+    return m ? { x: Number(m[3]), y: Number(m[4]), w: Number(m[1]), h: Number(m[2]) } : null
+  }
+
+  function overlaps(a, b) {
+    return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+  }
+
+  function indicatorScreen(target, screens) {
+    if (!target || !screens) return null
+    var list = []
+    for (var i = 0; i < screens.length; i++) list.push(screens[i])
+    if (target.indexOf("monitor:") === 0) {
+      var name = target.slice(8)
+      for (var j = 0; j < list.length; j++) if (list[j].name !== name) return list[j]
+      return null
+    }
+    var region = parseRegion(target)
+    if (!region) return null
+    var bandW = Style.space(560), bandH = Style.space(160)
+    for (var k = 0; k < list.length; k++) {
+      var s = list[k]
+      if (!overlaps(region, { x: s.x, y: s.y, w: s.width, h: s.height })) return s
+    }
+    for (var n = 0; n < list.length; n++) {
+      var t = list[n]
+      if (!overlaps(region, { x: t.x + (t.width - bandW) / 2, y: t.y, w: bandW, h: bandH })) return t
+    }
+    return null
+  }
 
   // ---------------------------------------------------------------- lifecycle
 
@@ -235,6 +281,7 @@ Item {
       if (result.state === "recording") {
         root.recordingFile = result.file
         root.startedAt = Number(result.startedAt) || Date.now()
+        root.recordedTarget = result.target || ""
         if (root.phase !== "recording") {
           root.opened = false
           root.phase = "recording"
@@ -271,6 +318,7 @@ Item {
       }
       root.recordingFile = result.file
       root.startedAt = Number(result.startedAt) || Date.now()
+      root.recordedTarget = result.target || ""
       root.nowMs = Date.now()
       root.phase = "recording"
       return
@@ -614,6 +662,14 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
           }
+          Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            visible: root.pillWillHide
+            text: "No REC pill, so the video stays clean · " + root.hotkeyLabel + " stops"
+            color: root.muted
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
         }
 
         // ---- saved
@@ -724,7 +780,8 @@ Item {
 
   PanelWindow {
     id: pill
-    visible: root.pillVisible
+    visible: root.pillVisible && root.pillScreen !== null
+    screen: root.pillScreen
     anchors { top: true }
     margins { top: Style.gapsOut * 2 }
     implicitWidth: pillBody.width

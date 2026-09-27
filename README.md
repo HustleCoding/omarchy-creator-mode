@@ -2,12 +2,13 @@
 
 A keyboard-driven screen-recording panel for **Omarchy 4.0.4**: press a key, see a clean
 **3 · 2 · 1** countdown, record the focused monitor (or an area, window or monitor picked with Omarchy's own picker) with a live timer, then get the saved
-file path and an **Open folder** action. It is a native Omarchy shell plugin, it follows
+file path and an **Open folder** action. None of its own UI ends up in the video (see
+[Clean video](#clean-video)). It is a native Omarchy shell plugin, it follows
 the active theme, and it installs only into your home directory.
 
 ```
 SUPER + ALT + R   → panel (idle)
-Enter             → 3 · 2 · 1 → REC ● 00:12   (top-center pill, not captured as a modal)
+Enter             → 3 · 2 · 1 → REC ● 00:12   (pill kept out of the captured area)
 SUPER + ALT + R   → Saving… → "Recording saved" · path · O Open folder
 ```
 
@@ -35,7 +36,7 @@ Hyprland key ──► omarchy-shell shell summon hustlecoding.creator-mode '{"h
   CreatorMode.qml (overlay plugin, keepLoaded, runs inside Omarchy's Quickshell)
     phases: idle → [picking →] countdown → starting → recording → saving → saved | error
     • centered card: layer-shell Overlay, exclusive keyboard focus (panel states)
-    • top-center REC pill (below the bar): no keyboard focus, so you can keep working while recording
+    • REC/Saving pill: no keyboard focus; placed on a screen area the recording doesn't cover, or hidden
     • every action = one Process call, one JSON reply
                         │  bash bin/creator-mode-rec <cmd>
                         ▼
@@ -58,6 +59,7 @@ Guarantees:
 - **Only our process is ever stopped.** No `pkill`: the tracked PID is signalled only after `/proc/<pid>/cmdline` confirms it is still writing our output file. A foreign recording is never touched; the panel explains how to stop it.
 - **"Recording" is honest.** The pill appears only after the controller confirms the recorder is alive and writing. If the recorder dies at startup, you see its last error line instead.
 - **"Saved" is honest.** The saved state appears only after the recorder exits and `ffprobe` can read the file. If the recorder crashed but left a readable file, it is shown as *recovered*. An unreadable file is reported as an error, with its path.
+- **Clean video.** See below.
 - **State survives shell restarts.** Recording state lives in the controller's state file, not in QML. After `omarchy-restart-shell`, re-opening the panel finds and can stop the running recording.
 
 Keys:
@@ -70,6 +72,18 @@ Keys:
 | recording | hotkey (`SUPER + ALT + R`) stops |
 | saved | `O` open folder · `Enter` new recording · `Esc` done |
 | error | `Enter` retry · `Esc` close |
+
+## Clean video
+
+Creator Mode keeps its own UI out of the recording:
+
+- The card hides before the recorder starts (and before the picker opens), and only comes back after the recording is saved.
+- The REC/Saving pill is placed according to what is being recorded. The controller reports the resolved target (`monitor:NAME` or `region:WxH+X+Y`) and the panel picks a spot outside it:
+  - **Monitor / full screen:** the pill goes to another monitor if you have one. With a single monitor it is hidden.
+  - **Area or window:** the pill goes to a monitor the area doesn't touch, or top-center on the same monitor if the area stays clear of that spot. Otherwise it is hidden.
+- When the pill will be hidden, the countdown says so: "No REC pill, so the video stays clean · Super + Alt + R stops". `SUPER + ALT + R` still stops the recording.
+
+Not Creator Mode's UI, so still captured: Omarchy's bar (including its own recording icon, which lights up for any `gpu-screen-recorder`) and notifications, when they are inside the recorded area.
 
 ## Dependencies
 
@@ -144,6 +158,10 @@ A second pass ran on the official `omarchy-4.0.4.iso` installed in a QEMU/KVM VM
 | Success path (wf-recorder stand-in, real Hyprland capture) | countdown → REC pill with a live timer → Saving… → Saved. The file was 1920x1080 and `ffprobe` read 11.7 s. `O` opened Nautilus on `~/Videos`. |
 | Pick area (`P`) | Omarchy's picker (slurp + frozen screen) opened with the panel hidden. `Esc` returned to idle with "Selection cancelled". A dragged 801×501 area → countdown "Area 801×501" → REC → Saved; wf-recorder got `-g 399,299 801x501` and `ffprobe` read an 800×500, 7.4 s file (the stand-in's x264 rounds to even sizes). `Enter` over a window → "Area 1896×1030" (the window). `Ctrl + Enter` → "Monitor Virtual-1". |
 | Foreign recorder guard | With an outside `gpu-screen-recorder` process running, start was refused and the outside process was left running. |
+| Clean video: single monitor, full screen | Countdown showed the "No REC pill" line; no `creator-mode-indicator` layer existed while recording (`hyprctl layers`); a frame from the saved file shows no Creator Mode UI. Saved card appeared after stop. |
+| Clean video: area in the lower half (1201×501+299+499) | Pill shown top-center, outside the area; a frame from the saved file shows only the area, no pill. |
+| Clean video: area covering the top-center spot (901×641+499+59) | Countdown showed the "No REC pill" line; no indicator layer while recording. |
+| Clean video: two monitors (`hyprctl output create headless`), recording `Virtual-1` | Indicator layer was on the second monitor only; saved file 1920×1080. |
 | `./uninstall.sh` | Removed the binding block, the plugin dir, and the `shell.json` entry. The recordings were kept. |
 
 The VM showed that the REC pill in the top-right corner overlapped the bar and Omarchy's notification toasts. The pill now sits top-center, below the bar.
@@ -151,7 +169,7 @@ The VM showed that the REC pill in the top-right corner overlapped the bar and O
 **Still needs your machine (real GPU):**
 
 1. The real `gpu-screen-recorder` success path: file quality, encoder choice, audio (desktop / mic).
-2. The REC pill's readability on your monitor and theme, including HiDPI.
+2. The REC pill's readability on your monitor and theme, including HiDPI, and its placement on a real multi-monitor layout (scaled monitors in particular).
 
 ## Local test checklist
 
@@ -160,7 +178,7 @@ Run on the Omarchy desktop after `./install.sh`.
 - [ ] **Open:** `SUPER + ALT + R` shows the themed card: "Ready to record", "Full screen, or pick an area, window or monitor · No audio", key hints.
 - [ ] **Pick area:** `SUPER + ALT + R` → `P`. The card hides and Omarchy's picker appears. `Esc` returns to the card with "Selection cancelled". `P` again, drag an area: the countdown shows "Area W×H", and the saved video shows only that area.
 - [ ] **Countdown cancel:** `Enter`, then `Esc` during the countdown. The card returns to idle with "Countdown cancelled". No file is created, and `pgrep -a gpu-screen-recorder` prints nothing.
-- [ ] **Start:** `Enter` shows 3 → 2 → 1, the card disappears, and the top-center **● REC 00:00** pill counts up. `pgrep -a gpu-screen-recorder` shows one process.
+- [ ] **Start:** `Enter` shows 3 → 2 → 1, the card disappears. With one monitor there is no pill (the countdown says so); with a second monitor the **● REC 00:00** pill counts up there. Neither appears in the saved video. `pgrep -a gpu-screen-recorder` shows one process.
 - [ ] **Duplicate guard:** press `ALT + PRINT` (Omarchy's recorder) while Creator Mode is idle, then `SUPER + ALT + R` → `Enter`. You get the "Another recording is running" error, and the other recording keeps running. Stop it with `ALT + PRINT`.
 - [ ] **Stop:** while recording, press `SUPER + ALT + R`. The pill shows **Saving…**, then the card shows "Recording saved" with duration, size, and the full path.
 - [ ] **Saved output:** `ffprobe <path>` reports a duration close to the timer; the file plays in your video player.
@@ -179,7 +197,7 @@ Run on the Omarchy desktop after `./install.sh`.
 | 0:18 | Press `SUPER + ALT + R` | "Here's the panel. It picks up my theme, shows which monitor it will capture, and every action has a key." |
 | 0:25 | Press `Enter`, then `Esc` during the countdown | "Countdown, and Escape cancels it. Nothing was recorded." |
 | 0:30 | Press `Enter`, let 3-2-1 finish | "Now for real: three, two, one…" |
-| 0:34 | Point at the top-center pill, do something on screen | "The red REC pill only shows up once the recorder has actually started writing. The timer is live." |
+| 0:34 | Do something on screen (or point at the pill on your second monitor) | "The panel is gone, and the REC pill never lands inside what's being recorded, so the video stays clean." |
 | 0:44 | Press `SUPER + ALT + R` | "Same key to stop. It says Saving until the file is finalized and verified…" |
 | 0:48 | Saved card | "…and here's the exact file, with length and size." |
 | 0:52 | Press `O` | "O opens the folder with the file selected." |
@@ -197,6 +215,7 @@ Run on the Omarchy desktop after `./install.sh`.
 
 - No webcam overlay (out of scope). Portal capture (`OMARCHY_SCREENRECORD_USE_PORTAL`) isn't supported; Creator Mode always uses the kms backend like Omarchy's default.
 - A foreign `gpu-screen-recorder` is detected by process name. Creator Mode refuses to start next to it but never stops it.
+- The pill placement uses the monitor geometry Quickshell reports; it is untested on scaled or rotated multi-monitor layouts.
 - Omarchy's built-in bar indicator (which watches for `gpu-screen-recorder`) may also light up while Creator Mode records. It doesn't conflict.
 - Clicking the bar indicator runs Omarchy's own stop, which kills all recorders. Creator Mode then sees its recorder exit and reports "recovered" if the file is readable.
 

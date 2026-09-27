@@ -63,6 +63,7 @@ expect "status is idle before recording" '.ok and .state == "idle"'
 
 run start
 expect "start reports recording only once the file exists" '.ok and .state == "recording" and (.pid > 0)'
+expect "start resolves the focused monitor into the reported target" '.target == "monitor:TEST-1"'
 file=$(jq -r .file <<<"$out")
 pid=$(jq -r .pid <<<"$out")
 check "output file is under the Omarchy recordings dir" [ -s "$file" ] 
@@ -70,6 +71,7 @@ check "recorder is alive" kill -0 "$pid"
 
 run status
 expect "status reports the same recording" ".state == \"recording\" and .pid == $pid"
+expect "status reports the recorded target (for indicator placement)" '.target == "monitor:TEST-1"'
 
 run start
 expect "second start is refused (no duplicate recordings)" '.ok == false and .error == "already_recording"'
@@ -149,7 +151,7 @@ expect "malformed target is rejected" '.ok == false and .error == "usage"'
 
 export FAKE_RECORDER_ARGS="$TMP/args"
 run start --target=region:640x480+10+-20
-expect "region start records" '.ok and .state == "recording"'
+expect "region start records" '.ok and .state == "recording" and .target == "region:640x480+10+-20"'
 check "region is passed to the recorder as -w WxH+X+Y" bash -c "grep -qxF -- '640x480+10+-20' '$TMP/args' && ! grep -qxF -- -s '$TMP/args'"
 run stop
 expect "region recording saves" '.ok and .state == "saved"'

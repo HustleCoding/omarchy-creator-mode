@@ -104,10 +104,12 @@ load_state() {
   PID=""
   FILE=""
   STARTED=""
+  TARGET=""
   [[ -f $STATE_FILE ]] || return 1
   PID=$(sed -n 's/^pid=//p' "$STATE_FILE")
   FILE=$(sed -n 's/^file=//p' "$STATE_FILE")
   STARTED=$(sed -n 's/^started=//p' "$STATE_FILE")
+  TARGET=$(sed -n 's/^target=//p' "$STATE_FILE")
   [[ $PID =~ ^[0-9]+$ && -n $FILE ]]
 }
 
@@ -189,7 +191,7 @@ cmd_status() {
     return
   fi
   if is_ours_alive; then
-    printf '{"ok":true,"state":"recording","pid":%s,"file":%s,"startedAt":%s}\n' "$PID" "$(json_str "$FILE")" "${STARTED:-0}"
+    printf '{"ok":true,"state":"recording","pid":%s,"file":%s,"startedAt":%s,"target":%s}\n' "$PID" "$(json_str "$FILE")" "${STARTED:-0}" "$(json_str "$TARGET")"
   else
     printf '{"ok":true,"state":"crashed","file":%s,"startedAt":%s,"log":%s}\n' "$(json_str "$FILE")" "${STARTED:-0}" "$(json_str "$(log_tail)")"
   fi
@@ -256,6 +258,7 @@ cmd_start() {
     else
       monitor=$(focused_monitor)
       [[ -n $monitor ]] || fail "no_monitor" "Couldn't find the focused monitor (hyprctl monitors returned nothing)."
+      target="monitor:$monitor"
     fi
     capture_args=(-w "$monitor" -s "$(capture_size "$monitor")")
     ;;
@@ -311,7 +314,7 @@ cmd_start() {
   mv "$STATE_FILE.tmp" "$STATE_FILE"
   refresh_omarchy_indicator
 
-  printf '{"ok":true,"state":"recording","pid":%s,"file":%s,"startedAt":%s}\n' "$pid" "$(json_str "$file")" "$started"
+  printf '{"ok":true,"state":"recording","pid":%s,"file":%s,"startedAt":%s,"target":%s}\n' "$pid" "$(json_str "$file")" "$started" "$(json_str "$target")"
 }
 
 cmd_stop() {
