@@ -81,7 +81,7 @@ def probe(video):
             check=True, capture_output=True, text=True).stdout
         info = json.loads(raw)
     except (OSError, subprocess.CalledProcessError, ValueError) as e:
-        raise RenderError("probe_failed", f"Can't read {video} with ffprobe: {e}")
+        raise RenderError("probe_failed", f"Can't read {video} with ffprobe: {e}") from e
     streams = info.get("streams", [])
     vs = next((s for s in streams if s.get("codec_type") == "video"), None)
     if not vs:
@@ -103,7 +103,7 @@ def ffmpeg_script_flag():
     try:
         out = subprocess.run(["ffmpeg", "-hide_banner", "-version"], capture_output=True, text=True).stdout
     except OSError:
-        raise RenderError("missing_dependency", "Missing: ffmpeg. Install with: sudo pacman -S ffmpeg")
+        raise RenderError("missing_dependency", "Missing: ffmpeg. Install with: sudo pacman -S ffmpeg") from None
     m = re.search(r"ffmpeg version n?(\d+)\.(\d+)", out)
     if m and (int(m.group(1)), int(m.group(2))) < (7, 1):
         return "-filter_complex_script"
