@@ -4,7 +4,10 @@
 #
 #   creator-mode-rec check                       dependencies + output dir
 #   creator-mode-rec status                      idle | recording | crashed
-#   creator-mode-rec start [--audio=MODE]        MODE: none | desktop | desktop+mic
+#   creator-mode-rec pick                        Omarchy's region/window/monitor picker
+#   creator-mode-rec start [--audio=MODE] [--target=TARGET]
+#                                                MODE: none | desktop | desktop+mic
+#                                                TARGET: focused | monitor:NAME | region:WxH+X+Y
 #   creator-mode-rec stop                        stop OUR recording and verify the file
 #   creator-mode-rec reveal <file>               open the folder containing <file>
 #
@@ -23,6 +26,7 @@ LOCK_FILE="$STATE_DIR/lock"
 RECORDER="${CREATOR_MODE_RECORDER:-gpu-screen-recorder}"
 START_TIMEOUT="${CREATOR_MODE_START_TIMEOUT:-8}"
 STOP_TIMEOUT="${CREATOR_MODE_STOP_TIMEOUT:-20}"
+PICKER="${CREATOR_MODE_PICKER:-omarchy-capture-region}"
 
 json_str() {
   local s
@@ -150,7 +154,7 @@ focused_monitor() {
 capture_size() {
   [[ -n ${CREATOR_MODE_RESOLUTION:-} ]] && { echo "$CREATOR_MODE_RESOLUTION"; return; }
   local width height
-  read -r width height < <(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused == true) | "\(.width) \(.height)"')
+  read -r width height < <(hyprctl monitors -j 2>/dev/null | jq -r --arg name "$1" '.[] | select(.name == $name) | "\(.width) \(.height)"')
   if [[ ${width:-0} =~ ^[0-9]+$ && ${height:-0} =~ ^[0-9]+$ ]] && ((width > 3840 || height > 2160)); then
     echo "3840x2160"
   else
@@ -191,15 +195,39 @@ cmd_status() {
   fi
 }
 
+# Same selection flow and output mapping as omarchy-capture-screenrecording:
+# a pick matching a whole monitor records that monitor, anything else records
+# the region in logical coordinates (gpu-screen-recorder scales it itself).
+cmd_pick() {
+  command -v "$PICKER" >/dev/null 2>&1 || fail "missing_dependency" "Missing: $PICKER (ships with Omarchy)."
+  local selection
+  selection=$("$PICKER" smart --match-monitor 2>/dev/null) || fail "cancelled" "Selection cancelled"
+  selection=$(tail -n1 <<<"$selection")
+
+  if [[ $selection =~ ^monitor:([A-Za-z0-9._-]+)$ ]]; then
+    printf '{"ok":true,"target":%s,"label":%s}\n' "$(json_str "$selection")" "$(json_str "Monitor ${BASH_REMATCH[1]}")"
+  elif [[ $selection =~ ^(-?[0-9]+),(-?[0-9]+)[[:space:]]([0-9]+)x([0-9]+)$ ]]; then
+    local w=${BASH_REMATCH[3]} h=${BASH_REMATCH[4]}
+    ((w >= 2 && h >= 2)) || fail "cancelled" "Selection too small"
+    printf '{"ok":true,"target":%s,"label":%s}\n' \
+      "$(json_str "region:${w}x${h}+${BASH_REMATCH[1]}+${BASH_REMATCH[2]}")" "$(json_str "Area ${w}×${h}")"
+  else
+    fail "cancelled" "Selection cancelled"
+  fi
+}
+
 cmd_start() {
-  local audio="none" arg
+  local audio="none" target="focused" arg
   for arg in "$@"; do
     case $arg in
     --audio=*) audio=${arg#*=} ;;
+    --target=*) target=${arg#*=} ;;
     *) fail "usage" "Unknown option: $arg" ;;
     esac
   done
   case $audio in none | desktop | desktop+mic) ;; *) fail "usage" "Unknown audio mode: $audio" ;; esac
+  [[ $target == "focused" || $target =~ ^monitor:[A-Za-z0-9._-]+$ || $target =~ ^region:[0-9]+x[0-9]+\+-?[0-9]+\+-?[0-9]+$ ]] ||
+    fail "usage" "Unknown capture target: $target"
 
   require_deps
   with_lock
@@ -215,11 +243,23 @@ cmd_start() {
     fail "foreign_recording" "Another screen recording is already running (started outside Creator Mode). Stop it first, e.g. with Alt+Print."
   fi
 
-  local dir monitor size file stamp n=1
+  local dir monitor file stamp n=1 capture_args=()
   dir=$(ensure_output_dir) || exit 1
-  monitor=$(focused_monitor)
-  [[ -n $monitor ]] || fail "no_monitor" "Couldn't find the focused monitor (hyprctl monitors returned nothing)."
-  size=$(capture_size)
+  case $target in
+  region:*)
+    capture_args=(-w "${target#region:}")
+    [[ -n ${CREATOR_MODE_RESOLUTION:-} ]] && capture_args+=(-s "$CREATOR_MODE_RESOLUTION")
+    ;;
+  *)
+    if [[ $target == monitor:* ]]; then
+      monitor=${target#monitor:}
+    else
+      monitor=$(focused_monitor)
+      [[ -n $monitor ]] || fail "no_monitor" "Couldn't find the focused monitor (hyprctl monitors returned nothing)."
+    fi
+    capture_args=(-w "$monitor" -s "$(capture_size "$monitor")")
+    ;;
+  esac
 
   stamp=$(date +'%Y-%m-%d_%H-%M-%S')
   file="$dir/creator-mode-$stamp.mp4"
@@ -239,7 +279,7 @@ cmd_start() {
   # omarchy-shell (or closing the panel) never interrupts a recording; 9>&- keeps
   # the long-lived recorder from inheriting (and holding) the control lock, and
   # --default-signal undoes the SIGINT-ignore bash applies to background jobs.
-  setsid env --default-signal=INT "$RECORDER" -w "$monitor" -s "$size" -k auto -f 60 -fm cfr -fallback-cpu-encoding yes \
+  setsid env --default-signal=INT "$RECORDER" "${capture_args[@]}" -k auto -f 60 -fm cfr -fallback-cpu-encoding yes \
     -o "$file" "${audio_args[@]}" </dev/null >>"$LOG_FILE" 2>&1 9>&- &
   local pid=$!
 
@@ -267,7 +307,7 @@ cmd_start() {
 
   local started
   started=$(now_ms)
-  printf 'pid=%s\nfile=%s\nstarted=%s\naudio=%s\n' "$pid" "$file" "$started" "$audio" >"$STATE_FILE.tmp"
+  printf 'pid=%s\nfile=%s\nstarted=%s\naudio=%s\ntarget=%s\n' "$pid" "$file" "$started" "$audio" "$target" >"$STATE_FILE.tmp"
   mv "$STATE_FILE.tmp" "$STATE_FILE"
   refresh_omarchy_indicator
 
@@ -336,8 +376,9 @@ cmd_reveal() {
 case ${1:-} in
 check) cmd_check ;;
 status) cmd_status ;;
+pick) cmd_pick ;;
 start) shift; cmd_start "$@" ;;
 stop) cmd_stop ;;
 reveal) shift; cmd_reveal "$@" ;;
-*) fail "usage" "Usage: creator-mode-rec check|status|start [--audio=none|desktop|desktop+mic]|stop|reveal <file>" ;;
+*) fail "usage" "Usage: creator-mode-rec check|status|pick|start [--audio=none|desktop|desktop+mic] [--target=focused|monitor:NAME|region:WxH+X+Y]|stop|reveal <file>" ;;
 esac

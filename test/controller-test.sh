@@ -125,6 +125,40 @@ expect "a new recording can start after failures" '.ok and .state == "recording"
 run stop
 expect "and saves" '.ok and .state == "saved"'
 
+# Picker: the same omarchy-capture-region contract, faked.
+cat >"$TMP/picker" <<'PICK'
+#!/bin/bash
+[[ $* == "smart --match-monitor" ]] || exit 2
+[[ -n $FAKE_PICK ]] || exit 1
+echo "$FAKE_PICK"
+PICK
+chmod +x "$TMP/picker"
+export CREATOR_MODE_PICKER="$TMP/picker"
+
+FAKE_PICK="10,-20 640x480" run pick
+expect "pick maps a region to gpu-screen-recorder geometry" '.ok and .target == "region:640x480+10+-20"'
+FAKE_PICK="monitor:DP-2" run pick
+expect "pick keeps a whole-monitor selection as a monitor" '.ok and .target == "monitor:DP-2"'
+FAKE_PICK="" run pick
+expect "cancelled pick is reported as cancelled" '.ok == false and .error == "cancelled"'
+CREATOR_MODE_PICKER=definitely-not-installed run pick
+expect "missing picker is reported" '.ok == false and .error == "missing_dependency"'
+
+run start --target='region:1x1+0+0;rm -rf ~'
+expect "malformed target is rejected" '.ok == false and .error == "usage"'
+
+export FAKE_RECORDER_ARGS="$TMP/args"
+run start --target=region:640x480+10+-20
+expect "region start records" '.ok and .state == "recording"'
+check "region is passed to the recorder as -w WxH+X+Y" bash -c "grep -qxF -- '640x480+10+-20' '$TMP/args' && ! grep -qxF -- -s '$TMP/args'"
+run stop
+expect "region recording saves" '.ok and .state == "saved"'
+
+CREATOR_MODE_RESOLUTION=0x0 run start --target=monitor:DP-2
+check "picked monitor is passed to the recorder" grep -qxF -- 'DP-2' "$TMP/args"
+run stop
+unset FAKE_RECORDER_ARGS
+
 echo
 echo "$pass passed, $failed failed"
 ((failed == 0))

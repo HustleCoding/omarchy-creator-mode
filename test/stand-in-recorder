@@ -15,4 +15,7 @@ while (( $# > 0 )); do
 done
 
 [[ -n $monitor && -n $file ]] || { echo "stand-in: need -w and -o" >&2; exit 2; }
+if [[ $monitor =~ ^([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+)$ ]]; then
+  exec wf-recorder -y -g "${BASH_REMATCH[3]},${BASH_REMATCH[4]} ${BASH_REMATCH[1]}x${BASH_REMATCH[2]}" -c libx264 -r 30 -f "$file"
+fi
 exec wf-recorder -y -o "$monitor" -c libx264 -r 30 -f "$file"

@@ -20,7 +20,7 @@ Item {
   property string hotkeyLabel: "Super + Alt + R"
 
   property bool opened: false
-  property string phase: "idle"   // idle | countdown | starting | recording | saving | saved | error
+  property string phase: "idle"   // idle | picking | countdown | starting | recording | saving | saved | error
   property int count: 3
   property string notice: ""
 
@@ -28,6 +28,9 @@ Item {
   readonly property var audioLabels: ({ "none": "No audio", "desktop": "Desktop audio", "desktop+mic": "Desktop + mic" })
   property int audioIndex: 0
   readonly property string audioMode: audioModes[audioIndex]
+
+  property string captureTarget: "focused"
+  property string captureLabel: "Full screen · focused monitor"
 
   property string outputDir: ""
   property string recordingFile: ""
@@ -74,6 +77,7 @@ Item {
     case "countdown":
       root.cancelCountdown()
       return
+    case "picking":
     case "starting":
     case "saving":
       return
@@ -106,12 +110,29 @@ Item {
     run("check", ["check"])
   }
 
-  function beginCountdown() {
+  function refuseForeign() {
+    if (!root.foreignRecording) return false
+    root.fail("Another recording is running", "A screen recording started outside Creator Mode is still active. Stop it first (Alt + Print), then try again.")
+    return true
+  }
+
+  function recordFullScreen() {
     if (root.phase !== "idle") return
-    if (root.foreignRecording) {
-      root.fail("Another recording is running", "A screen recording started outside Creator Mode is still active. Stop it first (Alt + Print), then try again.")
-      return
-    }
+    root.captureTarget = "focused"
+    root.captureLabel = "Full screen · focused monitor"
+    root.beginCountdown()
+  }
+
+  function pickArea() {
+    if (root.phase !== "idle" || root.refuseForeign()) return
+    root.notice = ""
+    root.phase = "picking"
+    // Let the compositor unmap the overlay so the picker sees the real desktop.
+    pickDelay.restart()
+  }
+
+  function beginCountdown() {
+    if (root.phase !== "idle" || root.refuseForeign()) return
     root.count = 3
     root.notice = ""
     root.phase = "countdown"
@@ -227,6 +248,21 @@ Item {
       return
     }
 
+    if (action === "pick") {
+      root.phase = "idle"
+      root.opened = true
+      Qt.callLater(function() { keys.forceActiveFocus() })
+      if (!result.ok) {
+        if (result.error === "cancelled") root.notice = result.message
+        else root.fail("Can't pick an area", result.message)
+        return
+      }
+      root.captureTarget = result.target
+      root.captureLabel = result.label || result.target
+      root.beginCountdown()
+      return
+    }
+
     if (action === "start") {
       if (!result.ok) {
         root.fail(result.error === "already_recording" ? "Already recording" : "Recording didn't start", result.message)
@@ -307,7 +343,13 @@ Item {
   Timer {
     id: startDelay
     interval: 250
-    onTriggered: root.run("start", ["start", "--audio=" + root.audioMode])
+    onTriggered: root.run("start", ["start", "--audio=" + root.audioMode, "--target=" + root.captureTarget])
+  }
+
+  Timer {
+    id: pickDelay
+    interval: 250
+    onTriggered: root.run("pick", ["pick"])
   }
 
   Timer {
@@ -424,7 +466,8 @@ Item {
         if (s === "countdown") {
           if (k === Qt.Key_Escape) root.cancelCountdown()
         } else if (s === "idle") {
-          if (k === Qt.Key_Return || k === Qt.Key_Enter || k === Qt.Key_Space || k === Qt.Key_R) root.beginCountdown()
+          if (k === Qt.Key_Return || k === Qt.Key_Enter || k === Qt.Key_Space || k === Qt.Key_R) root.recordFullScreen()
+          else if (k === Qt.Key_P) root.pickArea()
           else if (k === Qt.Key_A) root.audioIndex = (root.audioIndex + 1) % root.audioModes.length
           else if (k === Qt.Key_Escape || k === Qt.Key_Q) root.dismiss()
           else handled = false
@@ -497,7 +540,7 @@ Item {
           Text {
             width: parent.width
             wrapMode: Text.Wrap
-            text: "Full screen · focused monitor · " + root.audioLabels[root.audioMode]
+            text: "Full screen, or pick an area, window or monitor · " + root.audioLabels[root.audioMode]
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
@@ -524,7 +567,8 @@ Item {
           visible: root.phase === "idle"
           width: parent.width
           spacing: Style.space(10)
-          KeyAction { keyLabel: "Enter"; label: "Start"; primary: true; onActivated: root.beginCountdown() }
+          KeyAction { keyLabel: "Enter"; label: "Full screen"; primary: true; onActivated: root.recordFullScreen() }
+          KeyAction { keyLabel: "P"; label: "Pick area"; onActivated: root.pickArea() }
           KeyAction { keyLabel: "A"; label: "Audio"; onActivated: root.audioIndex = (root.audioIndex + 1) % root.audioModes.length }
           KeyAction { keyLabel: "Esc"; label: "Close"; onActivated: root.dismiss() }
         }
@@ -565,7 +609,7 @@ Item {
           }
           Text {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "Esc to cancel"
+            text: root.captureLabel + " · Esc to cancel"
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.title

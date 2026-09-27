@@ -4,6 +4,7 @@
 # while running, finish on SIGINT) without capturing anything. Behaviour is
 # steered by FAKE_RECORDER_MODE: ok | exit-early | never-write | ignore-int.
 
+[[ -n ${FAKE_RECORDER_ARGS:-} ]] && printf '%s\n' "$@" >"$FAKE_RECORDER_ARGS"
 file=""
 while (( $# > 0 )); do
   [[ $1 == "-o" ]] && file=$2
