@@ -103,6 +103,31 @@ PY
 }
 check "cursor and webcam line up on the recorder's start mark, not the end mark" offsets
 
+motion() {
+  python3 - "$STUDIO" <<'PY'
+import importlib.machinery, importlib.util, math, sys
+loader = importlib.machinery.SourceFileLoader("studio", sys.argv[1])
+st = importlib.util.module_from_spec(importlib.util.spec_from_loader("studio", loader))
+loader.exec_module(st)
+ident = lambda x, y: (x, y)
+# rest at 0, a 0.5 s move to 600 logged at 60 Hz, then rest
+moves = [(0.0, 0.0, 0.0)] + [(1.0 + i / 60, 600 * i / 30, 0.0) for i in range(31)]
+out = st.smooth_cursor(moves, 150, 60, 0.0, ident, 0.55, 1.5)
+xs = [p[0] for p in out]
+mid = xs[int(1.25 * 60)]
+assert abs(mid - 300) < 25, mid                      # no lag behind the real move
+assert max(xs) < 601 and min(xs) > -1, (min(xs), max(xs))  # no overshoot
+assert abs(xs[60 + 45] - 600) < 1 and abs(xs[30]) < 1  # settles on the rests
+acc = [abs(xs[i + 1] - 2 * xs[i] + xs[i - 1]) for i in range(1, 149)]
+assert max(acc) < 6, max(acc)                        # eases in/out instead of snapping
+assert st.smooth_cursor(moves, 10, 60, -1.0, ident, 0.55, 1.5)[0] is None
+cam = st.camera_keyframed([(0, 0, 100, 50), (0, 0, 100, 50), (20, 10, 50, 25)], 2)
+assert cam[1] == (10.0, 5.0, 75.0, 37.5)
+assert st.to_output([(0, 0, 45.0, 22.5), None], [(20, 10, 50, 25)] * 2, 1000, 500) == [(0, 0, 500.0, 250.0), None]
+PY
+}
+check "cursor glides without lag or overshoot and is placed in the zoomed output" motion
+
 echo
 echo "$pass passed, $failed failed"
 [ "$failed" -eq 0 ]

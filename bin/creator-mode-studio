@@ -403,25 +403,63 @@ def sample_cursor(moves, n_frames, fps, offset, map_xy):
     return out
 
 
-def smooth_cursor(raw, fps, smoothing, jitter):
-    """Deadband against sensor jitter, then a critically damped spring."""
-    stiffness = 1400.0 * (1 - smoothing) + 90.0 * smoothing
-    sx = sy = None
-    held = None
-    out = []
-    dt = 1.0 / fps
-    for pos in raw:
-        if pos is None:
-            out.append(None)
+SMOOTH_RATE = 240.0     # Hz of the dense path the cursor is smoothed on
+TRACKER_STEP = 1 / 60.0  # the tracker's polling interval
+
+
+def smooth_cursor(moves, n_frames, fps, offset, map_xy, smoothing, jitter):
+    """Smoothed cursor position (work px, or None before the first sample) at each frame.
+
+    The logged samples (changes only, polled at ~60 Hz) become a dense path that
+    rests until just before each move, with sensor jitter held still. That path
+    is run through a critically damped spring forwards and then backwards, which
+    rounds off steps and corners without the lag of a one-way filter."""
+    out = [None] * n_frames
+    if not moves:
+        return out
+    keys, held = [], None
+    for t, x, y in moves:
+        if held is None or math.hypot(x - held[0], y - held[1]) > jitter:
+            held = (x, y)
+        if keys and t - keys[-1][0] > 2 * TRACKER_STEP:
+            keys.append((max(keys[-1][0], t - TRACKER_STEP), keys[-1][1], keys[-1][2]))
+        keys.append((t, held[0], held[1]))
+    t_first = keys[0][0]
+    t0 = max(offset, t_first)
+    t_end = offset + n_frames / fps
+    if t0 >= t_end:
+        return out
+    dt = 1.0 / SMOOTH_RATE
+    count = int(math.ceil((t_end - t0) / dt)) + 1
+    xs, ys = [0.0] * count, [0.0] * count
+    i = 0
+    for k in range(count):
+        t = t0 + k * dt
+        while i + 1 < len(keys) and keys[i + 1][0] <= t:
+            i += 1
+        ta, xa, ya = keys[i]
+        if i + 1 < len(keys) and keys[i + 1][0] > ta:
+            tb, xb, yb = keys[i + 1]
+            a = clamp((t - ta) / (tb - ta), 0.0, 1.0)
+            xa, ya = xa + (xb - xa) * a, ya + (yb - ya) * a
+        xs[k], ys[k] = map_xy(xa, ya)
+    smoothing = clamp(smoothing, 0.0, 1.0)
+    if smoothing > 0:
+        stiffness = 1400.0 * (1 - smoothing) + 90.0 * smoothing
+        for series in (xs, ys):
+            for order in (range(count), range(count - 1, -1, -1)):
+                sp = None
+                for k in order:
+                    if sp is None:
+                        sp = Spring(series[k], stiffness)
+                    series[k] = sp.step(series[k], dt)
+    for n in range(n_frames):
+        t = n / fps + offset
+        if t < t_first:
             continue
-        if held is None or math.hypot(pos[0] - held[0], pos[1] - held[1]) > jitter:
-            held = pos
-        if sx is None:
-            sx, sy = Spring(pos[0], stiffness), Spring(pos[1], stiffness)
-        if smoothing <= 0:
-            out.append(held)
-        else:
-            out.append((sx.step(held[0], dt), sy.step(held[1], dt)))
+        k = int(round((t - t0) / dt))
+        if 0 <= k < count:
+            out[n] = (xs[k], ys[k])
     return out
 
 
@@ -586,6 +624,33 @@ def camera_path(cursor, n_frames, fps, w, h, view, segments, fill):
         cy = clamp(cy, vh / 2, h - vh / 2)
         out.append((cx - vw / 2, cy - vh / 2, vw, vh))
     return out
+
+
+def camera_keyframed(camera, step):
+    """The viewport per frame as the renderer applies it: sampled every `step`
+    frames and linearly interpolated (see piecewise_expr)."""
+    n = len(camera)
+    out = []
+    for i in range(n):
+        a = (i // step) * step
+        b = min(a + step, n - 1)
+        if b <= a:
+            out.append(camera[a])
+            continue
+        f = (i - a) / (b - a)
+        out.append(tuple(p + (q - p) * f for p, q in zip(camera[a], camera[b], strict=True)))
+    return out
+
+
+def to_output(states, camera, out_w, out_h):
+    """Move sprite states from work px into the zoomed, scaled output video."""
+    res = []
+    for st, (left, top, vw, vh) in zip(states, camera, strict=True):
+        if st is None:
+            res.append(None)
+            continue
+        res.append((st[0], st[1], (st[2] - left) * out_w / vw, (st[3] - top) * out_h / vh))
+    return res
 
 
 def blur_windows(camera, fps, out_w, canvas_h):
@@ -1072,7 +1137,12 @@ def render(opts):
     gif = opts.export == "gif"
 
     # Work resolution/frame rate: everything (camera, cursor) is computed in this space.
-    fps = min(src_fps, 30.0) if preview else src_fps
+    if opts.fps:
+        fps = clamp(opts.fps, 10.0, 120.0)
+    elif preview:
+        fps = min(src_fps, 30.0)
+    else:
+        fps = max(src_fps, 60.0)
     if gif:
         fps = min(fps, 30.0)
     ws = 0.5 if preview and min(src_w, src_h) >= 720 else 1.0
@@ -1132,7 +1202,7 @@ def render(opts):
             return (x - region["x"]) * sx, (y - region["y"]) * sy
 
         raw = sample_cursor(moves, n_frames, fps, offset, map_xy)
-        cursor = smooth_cursor(raw, fps, clamp(opts.smoothing, 0.0, 1.0), JITTER * sx)
+        cursor = smooth_cursor(moves, n_frames, fps, offset, map_xy, opts.smoothing, JITTER)
         clicks_v = [t - offset for t in clicks if 0 <= t - offset < duration]
         keys_v = [t - offset for t in keys if 0 <= t - offset < duration]
         focus = clicks_v if (clicks_v or meta.get("input") == "evdev") else dwell_points(raw, fps, sx)
@@ -1195,18 +1265,26 @@ def render(opts):
         draw_cursor = have_events and not opts.no_cursor and any(p is not None for p in cursor)
         next_input = 1
 
+        graph.append(f"{head}{','.join(pre)}[v0]")
+        step = max(1, int(round(fps / 15)))
+        out_vw, out_vh = (vid_w, vid_h) if pad > 0 else (cw, ch)
+        # The cursor is drawn after the zoom, at output resolution, so it stays
+        # sharp and moves in whole output pixels instead of magnified ones.
+        cursor_chain, pos_cmd = [], None
         if draw_cursor:
+            k0 = out_vw / view[0]
             sheet, ring_png = os.path.join(work, "cursor.png"), os.path.join(work, "ring.png")
-            tw, th, hot = make_cursor_sheet(sheet, 22 * cursor_scale * opts.cursor_scale)
-            ring_size = make_ring_sheet(ring_png, 16 * cursor_scale, 3 * cursor_scale)
+            tw, th, hot = make_cursor_sheet(sheet, 22 * cursor_scale * opts.cursor_scale * k0)
+            ring_size = make_ring_sheet(ring_png, 16 * cursor_scale * k0, 3 * cursor_scale * k0)
             clicks_f = sorted(int(round(t * fps)) for t in clicks_v)
             blur = opts.motion_blur and not preview and not gif
-            main, g1, g2, ring = cursor_track(cursor, raw, clicks_f, fps, w, h, cursor_scale,
-                                              opts.hide_idle, blur)
+            tracks_ = cursor_track(cursor, raw, clicks_f, fps, w, h, cursor_scale, opts.hide_idle, blur)
+            cam_eff = camera_keyframed(camera, step)
+            main, g1, g2, ring = (to_output(t_, cam_eff, out_vw, out_vh) for t_ in tracks_)
             layers = [("ring", ring, ring_size, ring_size, ring_size / 2, ring_size / 2),
                       ("g2", g2, tw, th, hot, hot), ("g1", g1, tw, th, hot, hot),
                       ("cur", main, tw, th, hot, hot)]
-            layers = [ly for ly in layers if any(s is not None for s in ly[1])]
+            layers = [ly for ly in layers if any(s_ is not None for s_ in ly[1])]
             if layers:
                 crop_lines, pos_lines = sprite_commands(layers, fps)
                 crop_cmd, pos_cmd = os.path.join(work, "sprites.cmd"), os.path.join(work, "cursor.cmd")
@@ -1223,8 +1301,6 @@ def render(opts):
                     inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-i", sheet]
                     sheet_in = next_input
                     next_input += 1
-                pre.append(f"sendcmd=f='{pos_cmd}'")
-                graph.append(f"{head}{','.join(pre)}[v0]")
                 sprite_streams = {}
                 # one sendcmd reaches every filter in the graph; it sits on a
                 # sprite stream so tile changes land on the matching sprite frame
@@ -1242,19 +1318,26 @@ def render(opts):
                     for name in names:
                         graph.append(f"[sh_{name}]crop@{name}=w={tw}:h={th}:x=0:y=0[sp_{name}]")
                         sprite_streams[name] = f"[sp_{name}]"
-                for i, ly in enumerate(layers):
-                    dst = f"[c{i}]"
-                    graph.append(f"{src}{sprite_streams[ly[0]]}overlay@{ly[0]}=x={OFF}:y={OFF}:shortest=1{dst}")
-                    src = dst
+                cursor_chain = [(ly[0], sprite_streams[ly[0]]) for ly in layers]
             else:
                 draw_cursor = False
-        if not graph:
-            graph.append(f"{head}{','.join(pre)}[v0]")
+
+        def scaled(src, sw, sh):
+            """Scale the (zoomed) screen to its output size and draw the cursor on it."""
+            chain = f"scale={sw}:{sh}:flags=lanczos"
+            if not cursor_chain:
+                graph.append(f"{src}{chain}[sv]")
+                return "[sv]"
+            graph.append(f"{src}{chain},format=yuv420p,sendcmd=f='{pos_cmd}'[sv]")
+            src = "[sv]"
+            for i, (name, stream) in enumerate(cursor_chain):
+                graph.append(f"{src}{stream}overlay@{name}=x={OFF}:y={OFF}:shortest=1[cv{i}]")
+                src = f"[cv{i}]"
+            return src
 
         full = all(abs(l0) < 0.5 and abs(t0) < 0.5 and abs(vw - w) < 0.5 and abs(vh - h) < 0.5
                    for l0, t0, vw, vh in camera)
         if not full:
-            step = max(1, int(round(fps / 15)))
             left = [c[0] for c in camera]
             top = [c[1] for c in camera]
             right = [c[0] + c[2] - w for c in camera]
@@ -1279,14 +1362,16 @@ def render(opts):
             inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-i", backdrop,
                        "-loop", "1", "-framerate", f"{fps:g}", "-i", mask]
             b, m = next_input, next_input + 1
-            graph.append(f"{src}scale={vid_w}:{vid_h}:flags=lanczos,format=yuva420p[c0v]")
+            src = scaled(src, vid_w, vid_h)
+            graph.append(f"{src}format=yuva420p[c0v]")
             graph.append(f"[{m}:v]format=gray[mk]")
             graph.append("[c0v][mk]alphamerge[c1v]")
             graph.append(f"[{b}:v]format=yuv420p[bgv]")
             graph.append(f"[bgv][c1v]overlay={vid_x}:{vid_y}:shortest=1:format=auto[comp]")
             next_input += 2
         else:
-            graph.append(f"{src}scale={cw}:{ch}:flags=lanczos[comp]")
+            src = scaled(src, cw, ch)
+            graph.append(f"{src}null[comp]")
         src = "[comp]"
 
         cam = edits["webcam"]
@@ -1466,6 +1551,8 @@ def main():
                    help="preview renders at half size and 30 fps without motion blur")
     r.add_argument("--encoder", default="auto", choices=("auto", "x264", "vaapi"),
                    help="auto uses VAAPI when a test encode works, else x264")
+    r.add_argument("--fps", type=float,
+                   help="output frame rate (default: 60 or the source's if higher; preview 30)")
     r.add_argument("--smoothing", type=float, default=0.55, help="cursor smoothing 0..1 (default 0.55)")
     r.add_argument("--hide-idle", type=float, default=2.5, help="hide the cursor after N idle seconds; 0 never")
     r.add_argument("--cursor-scale", type=float, default=1.4, help="cursor size multiplier (default 1.4)")
