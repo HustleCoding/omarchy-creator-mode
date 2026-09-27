@@ -28,7 +28,7 @@ for cmd in omarchy-shell omarchy-plugin-validate omarchy-plugin-enable jq; do
 done
 
 missing=()
-for cmd in gpu-screen-recorder ffprobe flock hyprctl; do
+for cmd in gpu-screen-recorder ffmpeg ffprobe flock hyprctl python3; do
   command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
 if ((${#missing[@]} > 0)); then
@@ -52,7 +52,7 @@ stage=$(mktemp -d "$PLUGINS_DIR/.creator-mode.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 install -m 644 "$SRC/manifest.json" "$SRC/CreatorMode.qml" "$stage/"
 install -d "$stage/bin"
-install -m 755 "$SRC/bin/creator-mode-rec" "$stage/bin/"
+install -m 755 "$SRC/bin/creator-mode-rec" "$SRC/bin/creator-mode-track" "$SRC/bin/creator-mode-studio" "$stage/bin/"
 omarchy-plugin-validate "$stage" >/dev/null || die "plugin failed Omarchy's manifest validation"
 
 rm -rf "$DEST"

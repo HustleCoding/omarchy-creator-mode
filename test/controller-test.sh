@@ -159,6 +159,42 @@ check "picked monitor is passed to the recorder" grep -qxF -- 'DP-2' "$TMP/args"
 run stop
 unset FAKE_RECORDER_ARGS
 
+# Studio: cursor tracking alongside the recording, then the polished render.
+"$ROOT/test/fake-hypr-socket" "$TMP/hypr.sock" &
+sleep 0.3
+export CREATOR_MODE_HYPR_SOCKET="$TMP/hypr.sock" CREATOR_MODE_REGION="0,0,320,240" FAKE_RECORDER_ARGS="$TMP/args"
+
+run start --studio=maybe
+expect "unknown studio mode is rejected" '.ok == false and .error == "usage"'
+
+run start --studio=on
+expect "studio start tracks the cursor" '.ok and .state == "recording" and .studio == true'
+check "real cursor is hidden while the tracker redraws it" bash -c "grep -qxF -- -cursor '$TMP/args' && grep -qxF -- no '$TMP/args'"
+sleep 0.5
+run stop
+expect "studio stop reports the events file" '.ok and .state == "saved" and (.events | type) == "string"'
+file=$(jq -r .file <<<"$out")
+events=$(jq -r .events <<<"$out")
+check "events file has a header, cursor samples and an end mark" bash -c "
+  head -n1 '$events' | jq -e '.type == \"meta\" and .region.w == 320' >/dev/null &&
+  grep -q '\"x\":' '$events' && tail -n1 '$events' | jq -e '.type == \"end\"' >/dev/null"
+check "tracker has exited" bash -c "! pgrep -f -- '[-]-out $events' >/dev/null"
+
+out=$("$CTL" render "$file" --background=ocean 2>/dev/null | tail -n1)
+expect "render produces the studio cut next to the recording" '.ok and (.file | endswith("-studio.mp4")) and .cursor == true'
+check "studio cut is a readable video" bash -c "ffprobe -v error '$(jq -r .file <<<"$out")'"
+check "raw recording is left in place" [ -s "$file" ]
+
+run render "$TMP/nope.mp4"
+expect "render of a missing file is a clear error" '.ok == false and .error == "not_found"'
+
+CREATOR_MODE_HYPR_SOCKET="$TMP/missing.sock" run start --studio=on
+expect "tracker failure degrades to a plain recording" '.ok and .studio == false and (.notice | test("Cursor tracking failed"))'
+check "real cursor stays visible without the tracker" bash -c "! grep -qxF -- -cursor '$TMP/args'"
+run stop
+expect "and still saves" '.ok and .state == "saved" and .events == null'
+unset FAKE_RECORDER_ARGS CREATOR_MODE_HYPR_SOCKET CREATOR_MODE_REGION
+
 echo
 echo "$pass passed, $failed failed"
 ((failed == 0))
