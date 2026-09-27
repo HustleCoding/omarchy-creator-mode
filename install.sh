@@ -64,7 +64,13 @@ say "Installed plugin files to $DEST"
 
 if omarchy-shell shell ping >/dev/null 2>&1; then
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
-  enabled=$(omarchy-shell shell listPlugins 2>/dev/null | jq -r --arg id "$ID" '.[] | select(.id == $id) | .enabled' 2>/dev/null || true)
+  # The rescan finishes asynchronously; wait for the shell to know the plugin.
+  enabled=""
+  for _ in {1..50}; do
+    enabled=$(omarchy-shell shell listPlugins 2>/dev/null | jq -r --arg id "$ID" '.[] | select(.id == $id) | .enabled' 2>/dev/null || true)
+    [[ -n $enabled ]] && break
+    sleep 0.1
+  done
   if [[ $enabled == "true" ]]; then
     say "Plugin already enabled"
     [[ $was_installed == "true" ]] && say "Run omarchy-restart-shell to load the updated version (a running recording keeps going)."
