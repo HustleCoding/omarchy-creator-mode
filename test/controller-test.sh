@@ -185,6 +185,14 @@ expect "render produces the studio cut next to the recording" '.ok and (.file | 
 check "studio cut is a readable video" bash -c "ffprobe -v error '$(jq -r .file <<<"$out")'"
 check "raw recording is left in place" [ -s "$file" ]
 
+rm -f "${file%.mp4}-studio.mp4"
+"$CTL" render "$file" >"$TMP/render.out" 2>/dev/null &
+rpid=$!
+for _ in $(seq 100); do grep -q progress "$TMP/render.out" && break; sleep 0.05; done
+kill -TERM "$rpid"; wait "$rpid" 2>/dev/null
+check "cancelled render stops ffmpeg" bash -c "sleep 0.3; ! pgrep -f -- '[-]studio.mp4.part.mp4' >/dev/null"
+check "cancelled render leaves no partial file" bash -c "! ls -A '$(dirname "$file")' | grep -q part.mp4"
+
 run render "$TMP/nope.mp4"
 expect "render of a missing file is a clear error" '.ok == false and .error == "not_found"'
 
