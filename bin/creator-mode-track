@@ -8,7 +8,9 @@ Cursor positions come from Hyprland's IPC socket (`j/cursorpos`), polled at
 ~60 Hz. Mouse buttons and key presses are read from /dev/input/event* when the
 user can read them (member of the `input` group); otherwise only the cursor is
 logged and the renderer infers focus points from where the cursor rests.
-Which key was pressed is never recorded, only that one was.
+Which key was pressed is never recorded, only that one was. Visible windows
+(position, size and app class, never titles) are logged a few times a second
+so the renderer can draw a text cursor over terminals.
 
 Output is JSON lines. The first line is a header; `t` is seconds since the
 header's `start` (wall clock). SIGTERM/SIGINT writes an `end` line and exits.
@@ -33,6 +35,7 @@ MODIFIER_KEYS = {29, 42, 54, 56, 97, 100, 125, 126}
 EVENT_FORMAT = "llHHi"
 EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
 POLL_HZ = 60
+WINDOW_HZ = 4
 
 
 def hypr_socket_path():
@@ -47,19 +50,35 @@ def hypr_socket_path():
     return None
 
 
-def cursor_pos(path):
+def hypr_json(path, cmd):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
         s.connect(path)
-        s.sendall(b"j/cursorpos")
+        s.sendall(b"j/" + cmd)
         chunks = []
         while True:
-            chunk = s.recv(4096)
+            chunk = s.recv(65536)
             if not chunk:
                 break
             chunks.append(chunk)
-    data = json.loads(b"".join(chunks))
+    return json.loads(b"".join(chunks))
+
+
+def cursor_pos(path):
+    data = hypr_json(path, b"cursorpos")
     return float(data["x"]), float(data["y"])
+
+
+def visible_windows(path):
+    """[[x, y, w, h, class], ...] on the shown workspaces, topmost first."""
+    shown = {m["activeWorkspace"]["id"] for m in hypr_json(path, b"monitors")}
+    shown |= {m["specialWorkspace"]["id"] for m in hypr_json(path, b"monitors")
+              if m.get("specialWorkspace", {}).get("id")}
+    wins = [c for c in hypr_json(path, b"clients")
+            if c.get("mapped", True) and not c.get("hidden") and c["workspace"]["id"] in shown]
+    wins.sort(key=lambda c: (not c.get("pinned"), not c.get("fullscreen"), not c.get("floating"),
+                             c.get("focusHistoryID", 99)))
+    return [[c["at"][0], c["at"][1], c["size"][0], c["size"][1], str(c.get("class", ""))] for c in wins]
 
 
 def open_input_devices():
@@ -117,9 +136,10 @@ def main():
         out.write(json.dumps(obj, separators=(",", ":")) + "\n")
 
     last = None
+    last_windows = None
     touch_down = {}
     interval = 1.0 / POLL_HZ
-    next_poll = time.monotonic()
+    next_poll = next_windows = time.monotonic()
     failures = 0
 
     while not stopping:
@@ -137,6 +157,15 @@ def main():
             if pos is not None and pos != last:
                 last = pos
                 emit({"t": round(time.time() - start, 4), "x": pos[0], "y": pos[1]})
+            if now_mono >= next_windows:
+                next_windows = now_mono + 1.0 / WINDOW_HZ
+                try:
+                    wins = visible_windows(sock)
+                except (OSError, ValueError, KeyError, TypeError):
+                    wins = None
+                if wins is not None and wins != last_windows:
+                    last_windows = wins
+                    emit({"t": round(time.time() - start, 4), "type": "windows", "w": wins})
 
         timeout = max(0.0, next_poll - time.monotonic())
         if not fds:

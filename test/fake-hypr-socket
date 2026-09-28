@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# TEST ONLY. Serves Hyprland's `j/cursorpos` IPC request on a Unix socket,
-# moving the cursor along a slow diagonal so the tracker has something to log.
+# TEST ONLY. Serves Hyprland's `j/cursorpos`, `j/monitors` and `j/clients` IPC
+# requests on a Unix socket, moving the cursor along a slow diagonal over one
+# terminal window so the tracker has something to log.
 import json
 import os
 import socket
@@ -17,6 +18,16 @@ t0 = time.time()
 while True:
     conn, _ = srv.accept()
     with conn:
-        if conn.recv(64) == b"j/cursorpos":
+        req = conn.recv(64)
+        if req == b"j/cursorpos":
             t = time.time() - t0
             conn.sendall(json.dumps({"x": int(40 + 60 * t), "y": int(30 + 40 * t)}).encode())
+        elif req == b"j/monitors":
+            conn.sendall(json.dumps([{"activeWorkspace": {"id": 1}, "specialWorkspace": {"id": 0}}]).encode())
+        elif req == b"j/clients":
+            conn.sendall(json.dumps([
+                {"at": [10, 10], "size": [300, 220], "class": "Alacritty", "workspace": {"id": 1},
+                 "mapped": True, "hidden": False, "floating": False, "focusHistoryID": 0},
+                {"at": [0, 0], "size": [320, 240], "class": "hidden-app", "workspace": {"id": 2},
+                 "mapped": True, "hidden": False, "floating": False, "focusHistoryID": 1},
+            ]).encode())

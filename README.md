@@ -22,7 +22,8 @@ After you stop, `bin/creator-mode-studio` renders `<name>-studio.mp4` next to th
 - **Auto-zoom** (1.8×) eased in just before each click, held while you click or type nearby. A typing burst
   outside a zoom zooms in on the last click (the field you're typing into). Zooming and panning are one
   eased move; the camera pans only once the cursor leaves a dead zone, so small moves don't shake it.
-- **Smooth cursor** redrawn from the log: jitter is filtered out, then the path is smoothed forwards and backwards so it glides without lagging (`--smoothing 0..1`). It is drawn after the zoom at output resolution, so it stays sharp. Final renders are 60 fps (or the source rate if higher; `--fps` overrides).
+  A zoom that would cut through the start of lines of text is nudged left to just before them.
+- **Smooth cursor** redrawn from the log: jitter is filtered out, then the path is smoothed forwards and backwards so it glides without lagging (`--smoothing 0..1`). It is drawn after the zoom at output resolution, so it stays sharp. It grows a little with the zoom and becomes an I-beam over terminal windows (the tracker logs visible window positions and classes, 4 times a second). Final renders are 60 fps (or the source rate if higher; `--fps` overrides).
   It's an anti-aliased arrow with a soft shadow, squishes on click with an expanding **click ring**, and
   fades out after 2.5 s idle (`--hide-idle N`, `0` never).
 - **Motion blur** on fast cursor moves (`--no-motion-blur` to turn it off). `--camera-blur` also blends frames during fast zoom/pan moves; it's off by default because frame blending ghosts text at 30 fps.
@@ -83,7 +84,7 @@ $S render ~/Videos/creator-mode-….mp4 --format 1:1 --export gif --size 600
 ```
 
 Events are kept in `<recordings dir>/.creator-mode/<name>.events.jsonl` (cursor positions, click and keypress
-times only).
+times, and the position and app class of visible windows).
 
 ## Compatibility findings (Omarchy 4.0.4)
 

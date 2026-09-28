@@ -178,6 +178,8 @@ events=$(jq -r .events <<<"$out")
 check "events file has a header, cursor samples and an end mark" bash -c "
   head -n1 '$events' | jq -e '.type == \"meta\" and .region.w == 320' >/dev/null &&
   grep -q '\"x\":' '$events' && tail -n1 '$events' | jq -e '.type == \"end\"' >/dev/null"
+check "events file logs the visible windows (class only) for the cursor shape" bash -c "
+  grep '\"type\":\"windows\"' '$events' | head -n1 | jq -e '.w == [[10,10,300,220,\"Alacritty\"]]' >/dev/null"
 check "tracker has exited" bash -c "! pgrep -f -- '[-]-out $events' >/dev/null"
 
 out=$("$CTL" render "$file" --background=ocean 2>/dev/null | tail -n1)
