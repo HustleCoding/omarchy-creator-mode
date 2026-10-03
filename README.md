@@ -7,7 +7,7 @@ the active theme, and it installs only into your home directory.
 
 ```
 SUPER + ALT + R   → panel (idle)
-Enter             → 3 · 2 · 1 → REC ● 00:12   (top-center pill, not captured as a modal)
+Enter             → 3 · 2 · 1 → recording (nothing on screen; Omarchy's bar shows its recording dot)
 SUPER + ALT + R   → Saving… → Rendering studio cut 42% → "Studio cut saved" · path · O Open folder
 ```
 
@@ -22,10 +22,11 @@ After you stop, `bin/creator-mode-studio` renders `<name>-studio.mp4` next to th
 - **Auto-zoom** (1.8×) eased in just before each click, held while you click or type nearby. A typing burst
   outside a zoom zooms in on the last click (the field you're typing into). Zooming and panning are one
   eased move; the camera pans only once the cursor leaves a dead zone, so small moves don't shake it.
-- **Smooth cursor** redrawn from the log: jitter is filtered out, then spring-smoothed (`--smoothing 0..1`).
+  A zoom that would cut through the start of lines of text is nudged left to just before them.
+- **Smooth cursor** redrawn from the log: jitter is filtered out, then the path is smoothed forwards and backwards so it glides without lagging (`--smoothing 0..1`). It is drawn after the zoom at output resolution, so it stays sharp. It grows a little with the zoom and becomes an I-beam over terminal windows (the tracker logs visible window positions and classes, 4 times a second). Final renders are 60 fps (or the source rate if higher; `--fps` overrides).
   It's an anti-aliased arrow with a soft shadow, squishes on click with an expanding **click ring**, and
   fades out after 2.5 s idle (`--hide-idle N`, `0` never).
-- **Motion blur** on fast cursor moves and fast camera moves (`--no-motion-blur` to turn it off).
+- **Motion blur** on fast cursor moves (`--no-motion-blur` to turn it off). `--camera-blur` also blends frames during fast zoom/pan moves; it's off by default because frame blending ghosts text at 30 fps.
 - **Framing:** padding, rounded corners, soft drop shadow (`--shadow 0..1`), optional inset border
   (`--inset PX --inset-color #rrggbb`) and a background: the Omarchy theme gradient (default), `wallpaper`
   (your current Omarchy wallpaper, blurred; `--blur N`), presets `midnight sunset ocean aurora candy peach
@@ -37,8 +38,37 @@ After you stop, `bin/creator-mode-studio` renders `<name>-studio.mp4` next to th
 - **Speed:** `--quality preview` renders at half size, 30 fps, without motion blur (~8× faster).
   `--encoder auto` (default) uses VAAPI (`h264_vaapi`) when a test encode on `/dev/dri/renderD*` works,
   otherwise libx264; `--encoder vaapi|x264` forces one.
-- Audio is copied untouched (not in GIFs). The raw recording is never modified; a failed or skipped render
-  (`Esc`) still leaves it saved.
+- Audio is copied untouched (not in GIFs) unless you change levels or edit the timeline. The raw recording
+  is never modified; a failed or skipped render (`Esc`) still leaves it saved.
+
+### Timeline editor
+
+`E` on the saved screen (or `creator-mode-rec edit <file>`) opens a local editor in your browser
+(`bin/creator-mode-editor`, served on `127.0.0.1` behind a random token, standard library only). It shows
+the raw recording with a filmstrip and three tracks:
+
+- **Trim** with the filmstrip handles or `I`/`O` at the playhead.
+- **Cut** (`X`) or **speed up** (`S`, 1.5–8×, or 0.5× slow-mo) a range you drag across the filmstrip.
+- **Zooms:** the automatic zooms are shown dashed. Drag to move, drag the edges to resize, change the level,
+  click the video to choose where it zooms, turn cursor-follow on/off, `Del` to remove, `Z` to add one.
+  *Auto zooms* goes back to the automatic ones and *No zooms* removes them all.
+- **Audio:** desktop and mic levels (separate when recorded with Studio + desktop+mic) and noise reduction.
+- **Webcam:** show/hide the bubble, corner, size, mirror.
+- Background, format and GIF/MP4 export, then *Quick preview* or *Render*; the result plays in the page.
+
+Playback in the editor skips cuts, plays sped-up ranges faster and previews the zooms. Edits are saved as
+you go to `.creator-mode/<name>.edit.json`; every later render (including `creator-mode-studio render`)
+applies them. `--no-edits` ignores the file and `creator-mode-studio plan <file>` prints the zoom plan and
+the edits as JSON.
+
+### Webcam and audio
+
+With Studio on, `W` in the panel turns on the **webcam bubble**. `ffmpeg` records `/dev/video0` next to
+the screen (`.creator-mode/<name>.webcam.mkv`) and the render puts it in a round, bordered bubble in a
+corner (bottom right, 24% of the short side by default). Set `CREATOR_MODE_WEBCAM_DEVICE` to use
+another camera. With Studio on and `desktop+mic` audio, the recording gets three tracks: the usual mix
+(what players play), desktop only and mic only. That way the studio render and the editor can set
+`--system-volume`, `--mic-volume` and `--denoise` separately.
 
 Without access to `/dev/input` (you're not in the `input` group), clicks can't be seen and zooms follow
 where the cursor comes to rest instead. For click-accurate zooms: `sudo usermod -aG input $USER` and log in
@@ -54,7 +84,7 @@ $S render ~/Videos/creator-mode-….mp4 --format 1:1 --export gif --size 600
 ```
 
 Events are kept in `<recordings dir>/.creator-mode/<name>.events.jsonl` (cursor positions, click and keypress
-times only).
+times, and the position and app class of visible windows).
 
 ## Compatibility findings (Omarchy 4.0.4)
 
@@ -80,7 +110,7 @@ Hyprland key ──► omarchy-shell shell summon hustlecoding.creator-mode '{"h
   CreatorMode.qml (overlay plugin, keepLoaded, runs inside Omarchy's Quickshell)
     phases: idle → [picking →] countdown → starting → recording → saving → saved | error
     • centered card: layer-shell Overlay, exclusive keyboard focus (panel states)
-    • top-center REC pill (below the bar): no keyboard focus, so you can keep working while recording
+    • no on-screen pill while recording (layer surfaces are captured); a Saving… pill after stop
     • every action = one Process call, one JSON reply
                         │  bash bin/creator-mode-rec <cmd>
                         ▼
@@ -109,12 +139,12 @@ Keys:
 
 | State | Keys |
 | --- | --- |
-| idle | `Enter`/`Space`/`R` full screen · `P` pick area/window/monitor, then countdown · `A` cycle audio (none → desktop → desktop+mic) · `S` studio on/off · `B` cycle background · `F` cycle format (source → 16:9 → 9:16 → 1:1) · `Esc`/`Q` close |
+| idle | `Enter`/`Space`/`R` full screen · `P` pick area/window/monitor, then countdown · `A` cycle audio (none → desktop → desktop+mic) · `S` studio on/off · `B` cycle background · `F` cycle format (source → 16:9 → 9:16 → 1:1 → 4:5) · `W` webcam bubble (studio on, camera found) · `Esc`/`Q` close |
 | picking | Omarchy's picker keys: drag an area, click a window, `Enter` highlighted window, `Ctrl + Enter` whole monitor, `Esc` cancels back to idle |
 | countdown | `Esc` or the hotkey cancels |
 | recording | hotkey (`SUPER + ALT + R`) stops |
 | rendering | `Esc` skips the studio cut (raw recording stays saved) |
-| saved | `O` open folder · `Enter` new recording · `Esc` done |
+| saved | `O` open folder · `E` edit timeline · `Enter` new recording · `Esc` done |
 | error | `Enter` retry · `Esc` close |
 
 ## Dependencies
@@ -251,9 +281,10 @@ Run on the Omarchy desktop after `./install.sh`.
 ```bash
 bash -n bin/creator-mode-rec
 shellcheck -x bin/creator-mode-rec install.sh uninstall.sh test/*.sh test/fake-recorder test/stand-in-recorder
-python3 -m py_compile bin/creator-mode-track bin/creator-mode-studio
+python3 -m py_compile bin/creator-mode-track bin/creator-mode-studio bin/creator-mode-editor
 ./test/controller-test.sh        # needs ffmpeg/ffprobe + flock; fake recorder + fake Hyprland socket
 ./test/studio-test.sh            # renders a synthetic clip with every format/export option
+./test/editor-test.sh            # timeline edits, webcam, split audio, and the editor's HTTP API
 ```
 
 Environment overrides (for testing only): `CREATOR_MODE_RECORDER`, `CREATOR_MODE_MONITOR`,

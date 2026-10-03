@@ -178,6 +178,8 @@ events=$(jq -r .events <<<"$out")
 check "events file has a header, cursor samples and an end mark" bash -c "
   head -n1 '$events' | jq -e '.type == \"meta\" and .region.w == 320' >/dev/null &&
   grep -q '\"x\":' '$events' && tail -n1 '$events' | jq -e '.type == \"end\"' >/dev/null"
+check "events file logs the visible windows (class only) for the cursor shape" bash -c "
+  grep '\"type\":\"windows\"' '$events' | head -n1 | jq -e '.w == [[10,10,300,220,\"Alacritty\"]]' >/dev/null"
 check "tracker has exited" bash -c "! pgrep -f -- '[-]-out $events' >/dev/null"
 
 out=$("$CTL" render "$file" --background=ocean 2>/dev/null | tail -n1)
@@ -195,6 +197,43 @@ check "cancelled render leaves no partial file" bash -c "! ls -A '$(dirname "$fi
 
 run render "$TMP/nope.mp4"
 expect "render of a missing file is a clear error" '.ok == false and .error == "not_found"'
+
+# Studio + desktop+mic keeps desktop and mic on their own tracks; webcam via ffmpeg.
+export CREATOR_MODE_WEBCAM_FORMAT=lavfi CREATOR_MODE_WEBCAM_DEVICE="testsrc2=s=160x120:r=15"
+run check
+expect "check reports a usable webcam" '.ok and .webcam == true'
+run start --webcam=maybe
+expect "unknown webcam mode is rejected" '.ok == false and .error == "usage"'
+run start --studio=on --audio=desktop+mic --webcam=on
+expect "studio start with webcam reports it" '.ok and .studio == true and .webcam == true'
+file=$(jq -r .file <<<"$out")
+session="$(dirname "$file")/.creator-mode/$(basename "${file%.mp4}").session.json"
+check "desktop and mic get separate tracks after the mix" bash -c "[ \"\$(grep -cx -- -a '$TMP/args')\" = 3 ] && grep -qxF -- 'default_output|default_input' '$TMP/args' && grep -qxF -- default_input '$TMP/args'"
+check "session file lists the tracks and the webcam" bash -c "jq -e '.audio == [\"mix\",\"system\",\"mic\"] and (.webcam | endswith(\".webcam.mkv\"))' '$session' >/dev/null"
+check "session file records when the recorder and webcam started" bash -c "jq -e '(.recStart | type) == \"number\" and (.webcamStart | type) == \"number\" and .recStart >= .webcamStart' '$session' >/dev/null"
+wpid=$(sed -n 's/^webcam_pid=//p' "$CREATOR_MODE_STATE_DIR/state")
+sleep 1
+run stop
+expect "stop reports the webcam file" '.ok and .state == "saved" and (.webcam | type) == "string"'
+webcam=$(jq -r .webcam <<<"$out")
+check "webcam recorder has exited" bash -c "[ -n '$wpid' ] && ! kill -0 '$wpid' 2>/dev/null"
+check "webcam file is a readable video" bash -c "ffprobe -v error -show_entries format=duration -of csv=p=0 '$webcam' | grep -q '[1-9]'"
+
+CREATOR_MODE_EDITOR_NO_OPEN=1 run edit "$file"
+expect "edit starts the timeline editor on localhost" '.ok and (.url | test("^http://127[.]0[.]0[.]1:[0-9]+/"))'
+url=$(jq -r .url <<<"$out")
+check "editor serves the page" bash -c "curl -sf '$url' | grep -q 'Timeline'"
+curl -s -X POST -d '{}' "${url}quit" >/dev/null
+run edit "$TMP/nope.mp4"
+expect "edit of a missing file is a clear error" '.ok == false and .error == "not_found"'
+
+run start --webcam=on
+expect "webcam without studio records without it and says why" '.ok and .webcam == false and (.notice | test("needs Studio"))'
+run stop
+CREATOR_MODE_WEBCAM_FORMAT=v4l2 CREATOR_MODE_WEBCAM_DEVICE="$TMP/no-video0" run start --studio=on --webcam=on
+expect "missing camera is a notice, not a failure" '.ok and .webcam == false and (.notice | test("No webcam found"))'
+run stop
+unset CREATOR_MODE_WEBCAM_FORMAT CREATOR_MODE_WEBCAM_DEVICE
 
 CREATOR_MODE_HYPR_SOCKET="$TMP/missing.sock" run start --studio=on
 expect "tracker failure degrades to a plain recording" '.ok and .studio == false and (.notice | test("Cursor tracking failed"))'

@@ -10,7 +10,7 @@ What it does (all local, ffmpeg + Python standard library only):
   * smooth cursor: redraws the cursor from the logged path with jitter
     removal and spring smoothing, fades it out while idle, squishes it on
     clicks and draws an expanding click ring
-  * motion blur on fast cursor moves and fast camera moves
+  * motion blur on fast cursor moves (and, with --camera-blur, fast camera moves)
   * a padded background (Omarchy theme, blurred wallpaper, presets, colors or
     an image) with rounded corners, an optional inset border and a soft shadow
   * export presets: source, 16:9, 9:16, 1:1, 4:5; MP4 or GIF; preview quality;
@@ -53,6 +53,7 @@ PRESETS = {
     "mono": ("#3f3f46", "#09090b"),
 }
 FORMATS = {"16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:5": (4, 5)}
+CORNERS = ("br", "bl", "tr", "tl")
 THEME_COLORS = os.path.expanduser("~/.local/state/omarchy/current/theme/colors.toml")
 WALLPAPER = os.path.expanduser("~/.local/state/omarchy/current/background")
 
@@ -64,7 +65,7 @@ ZOOM_OUT = 0.95        # ease-out duration
 KEY_HOLD = 1.4         # typing keeps a zoom alive this long after the last key
 TYPE_GAP = 1.0         # keys closer than this are one typing burst
 TYPE_MIN = 3           # keys in a burst before it counts as typing
-MERGE_GAP = 1.2        # focus points closer than hold + this share one zoom
+MERGE_GAP = 2.5        # focus points closer than hold + this share one zoom (pan instead of out-and-in)
 DWELL_MOVE = 80        # logical px the cursor must travel before a rest counts
 DWELL_STILL = 6        # logical px of jitter allowed while resting
 DWELL_TIME = 0.45      # rest this long to count as a focus point
@@ -79,7 +80,14 @@ PRESS_DOWN = 0.06      # click squish: time to press down
 PRESS_UP = 0.18        # and to spring back
 PRESS_SCALE = 0.82
 RING_TIME = 0.45
-SCALES = (1.0, 0.955, 0.91, 0.865, 0.82)
+ZOOM_CURSOR = 0.6       # the cursor grows by zoom ** this, so it stays in proportion when zoomed
+CURSOR_GROW_MAX = 1.6
+LEVEL_STEP = 1.05       # size ratio between rows of the cursor sprite sheet
+TEXT_APPS = {"alacritty", "kitty", "foot", "footclient", "com.mitchellh.ghostty", "ghostty",
+             "org.wezfurlong.wezterm", "wezterm", "xterm", "konsole", "org.gnome.console",
+             "org.gnome.terminal", "gnome-terminal-server", "st", "st-256color", "urxvt"}
+FRAME_GUTTER = 0.012    # a blank run this wide (share of the zoomed view) marks where content starts
+FRAME_MARGIN = 0.03     # breathing room left of content when a zoom is nudged to show it
 ALPHAS = 11            # alpha levels in the cursor sprite sheet (0, 0.1, ... 1)
 RING_FRAMES = 9
 BLUR_START = 9.0       # cursor speed (logical px per 60 Hz frame) where the blur trail starts
@@ -150,6 +158,7 @@ def probe(video):
     return {
         "w": int(vs["width"]), "h": int(vs["height"]), "fps": fps, "duration": duration,
         "audio": any(s.get("codec_type") == "audio" for s in streams),
+        "audio_tracks": sum(1 for s in streams if s.get("codec_type") == "audio"),
     }
 
 
@@ -194,6 +203,124 @@ def default_events_path(video):
     return os.path.join(d, ".creator-mode", os.path.splitext(name)[0] + ".events.jsonl")
 
 
+def sidecar(video, suffix):
+    d, name = os.path.split(os.path.abspath(video))
+    return os.path.join(d, ".creator-mode", os.path.splitext(name)[0] + suffix)
+
+
+def load_json(path, what):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise RenderError("bad_" + what, f"Can't read {path}: {e}") from e
+    return data if isinstance(data, dict) else None
+
+
+def num(v, lo, hi, default):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return default if math.isnan(v) else clamp(v, lo, hi)
+
+
+def clean_edits(edits, duration):
+    """Validated copy of an edit file: every time is clamped into the video."""
+    edits = edits if isinstance(edits, dict) else {}
+
+    def span(item):
+        if isinstance(item, dict):
+            a, b = item.get("start"), item.get("end")
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            a, b = item
+        else:
+            return None
+        a, b = num(a, 0, duration, None), num(b, 0, duration, None)
+        return (a, b) if a is not None and b is not None and b - a >= 0.05 else None
+
+    out = {"version": 1}
+    trim = span(edits.get("trim"))
+    out["trim"] = list(trim) if trim else [0.0, duration]
+    out["cuts"] = sorted(list(c) for c in map(span, edits.get("cuts") or []) if c)
+    out["speed"] = []
+    for item in edits.get("speed") or []:
+        sp = span(item)
+        if sp and isinstance(item, dict):
+            out["speed"].append({"start": sp[0], "end": sp[1], "rate": num(item.get("rate"), 0.25, 8.0, 1.0)})
+    out["speed"].sort(key=lambda x: x["start"])
+    zooms = edits.get("zooms")
+    if isinstance(zooms, list):
+        out["zooms"] = []
+        for item in zooms:
+            sp = span(item)
+            if sp and isinstance(item, dict):
+                out["zooms"].append({"start": sp[0], "end": sp[1], "zoom": num(item.get("zoom"), 1.0, 4.0, 1.8),
+                                     "x": num(item.get("x"), 0, 1, 0.5), "y": num(item.get("y"), 0, 1, 0.5),
+                                     "follow": bool(item.get("follow", True))})
+        out["zooms"].sort(key=lambda z: z["start"])
+    else:
+        out["zooms"] = None
+    audio = edits.get("audio") if isinstance(edits.get("audio"), dict) else {}
+    out["audio"] = {"system": num(audio.get("system"), 0, 3, 1.0), "mic": num(audio.get("mic"), 0, 3, 1.0),
+                    "denoise": bool(audio.get("denoise", False))}
+    cam = edits.get("webcam") if isinstance(edits.get("webcam"), dict) else {}
+    corner = cam.get("corner") if cam.get("corner") in CORNERS else "br"
+    out["webcam"] = {"enabled": bool(cam.get("enabled", True)), "corner": corner,
+                     "size": num(cam.get("size"), 0.1, 0.45, 0.24), "mirror": bool(cam.get("mirror", True))}
+    if isinstance(edits.get("render"), dict):
+        out["render"] = {k: v for k, v in edits["render"].items() if isinstance(v, (str, int, float, bool))}
+    return out
+
+
+def timeline_pieces(edits, duration):
+    """Kept source ranges with playback rates, [(start, end, rate)], after trim, cuts and speed-ups."""
+    ranges = [tuple(edits["trim"])]
+    for a, b in edits["cuts"]:
+        nxt = []
+        for s0, e0 in ranges:
+            if b <= s0 or a >= e0:
+                nxt.append((s0, e0))
+                continue
+            if a > s0:
+                nxt.append((s0, a))
+            if b < e0:
+                nxt.append((b, e0))
+        ranges = nxt
+    pieces = []
+    for s0, e0 in ranges:
+        cur = s0
+        for sp in edits["speed"]:
+            a, b = max(sp["start"], cur), min(sp["end"], e0)
+            if b <= a:
+                continue
+            if a > cur:
+                pieces.append((cur, a, 1.0))
+            pieces.append((a, b, sp["rate"]))
+            cur = b
+        if cur < e0:
+            pieces.append((cur, e0, 1.0))
+    pieces = [p for p in pieces if p[1] - p[0] >= 0.05]
+    if not pieces:
+        raise RenderError("usage", "The edits remove the whole recording")
+    return pieces
+
+
+def atempo(rate):
+    parts = []
+    while rate > 2.0:
+        parts.append("atempo=2")
+        rate /= 2.0
+    while rate < 0.5:
+        parts.append("atempo=0.5")
+        rate /= 0.5
+    if abs(rate - 1.0) > 1e-3:
+        parts.append(f"atempo={rate:.4f}")
+    return ",".join(parts) or "anull"
+
+
 def load_events(path):
     meta, moves, clicks, keys, end = None, [], [], [], None
     with open(path) as f:
@@ -217,6 +344,66 @@ def load_events(path):
         raise RenderError("bad_events", f"{path} has no header line")
     moves.sort()
     return meta, moves, sorted(clicks), sorted(keys), end
+
+
+def load_windows(path):
+    """[(t, [[x, y, w, h, class], ...]), ...]: visible windows, topmost first."""
+    out = []
+    with open(path) as f:
+        for line in f:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict) and ev.get("type") == "windows" and isinstance(ev.get("w"), list):
+                wins = [w_ for w_ in ev["w"] if isinstance(w_, list) and len(w_) == 5]
+                out.append((float(ev["t"]), wins))
+    out.sort(key=lambda e: e[0])
+    return out
+
+
+def cursor_shapes(cursor, windows, fps, offset, map_xy):
+    """Per frame: "ibeam" over a terminal window, "arrow" elsewhere."""
+    shapes = ["arrow"] * len(cursor)
+    if not windows:
+        return shapes
+    rects = [(t, [(*map_xy(x, y), *map_xy(x + ww, y + wh), str(c).lower()) for x, y, ww, wh, c in wins])
+             for t, wins in windows]
+    i = -1
+    for n, pos in enumerate(cursor):
+        t = n / fps + offset
+        while i + 1 < len(rects) and rects[i + 1][0] <= t:
+            i += 1
+        if pos is None or i < 0:
+            continue
+        for x0, y0, x1, y1, cls in rects[i][1]:
+            if x0 <= pos[0] < x1 and y0 <= pos[1] < y1:
+                if cls in TEXT_APPS:
+                    shapes[n] = "ibeam"
+                break
+    return shapes
+
+
+def _num(v):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def capture_offset(meta, session, end, duration):
+    """Tracker time of the video's first frame. The controller notes when the
+    recorder first wrote to the file; recorders drop a variable tail on stop,
+    so the tracker's end mark is only a fallback."""
+    rec, start = _num(session.get("recStart")), _num(meta.get("start"))
+    if rec is not None and start is not None and 0 <= rec - start < 30:
+        return rec - start
+    return (end - duration) if end is not None else 0.0
+
+
+def webcam_lead(session, cam_duration, duration):
+    """Seconds of webcam footage before the screen recording's first frame."""
+    rec, cam = _num(session.get("recStart")), _num(session.get("webcamStart"))
+    if rec is not None and cam is not None and 0 <= rec - cam < 30:
+        return rec - cam
+    return cam_duration - duration
 
 
 # ------------------------------------------------------------------ motion
@@ -261,25 +448,63 @@ def sample_cursor(moves, n_frames, fps, offset, map_xy):
     return out
 
 
-def smooth_cursor(raw, fps, smoothing, jitter):
-    """Deadband against sensor jitter, then a critically damped spring."""
-    stiffness = 1400.0 * (1 - smoothing) + 90.0 * smoothing
-    sx = sy = None
-    held = None
-    out = []
-    dt = 1.0 / fps
-    for pos in raw:
-        if pos is None:
-            out.append(None)
+SMOOTH_RATE = 240.0     # Hz of the dense path the cursor is smoothed on
+TRACKER_STEP = 1 / 60.0  # the tracker's polling interval
+
+
+def smooth_cursor(moves, n_frames, fps, offset, map_xy, smoothing, jitter):
+    """Smoothed cursor position (work px, or None before the first sample) at each frame.
+
+    The logged samples (changes only, polled at ~60 Hz) become a dense path that
+    rests until just before each move, with sensor jitter held still. That path
+    is run through a critically damped spring forwards and then backwards, which
+    rounds off steps and corners without the lag of a one-way filter."""
+    out = [None] * n_frames
+    if not moves:
+        return out
+    keys, held = [], None
+    for t, x, y in moves:
+        if held is None or math.hypot(x - held[0], y - held[1]) > jitter:
+            held = (x, y)
+        if keys and t - keys[-1][0] > 2 * TRACKER_STEP:
+            keys.append((max(keys[-1][0], t - TRACKER_STEP), keys[-1][1], keys[-1][2]))
+        keys.append((t, held[0], held[1]))
+    t_first = keys[0][0]
+    t0 = max(offset, t_first)
+    t_end = offset + n_frames / fps
+    if t0 >= t_end:
+        return out
+    dt = 1.0 / SMOOTH_RATE
+    count = int(math.ceil((t_end - t0) / dt)) + 1
+    xs, ys = [0.0] * count, [0.0] * count
+    i = 0
+    for k in range(count):
+        t = t0 + k * dt
+        while i + 1 < len(keys) and keys[i + 1][0] <= t:
+            i += 1
+        ta, xa, ya = keys[i]
+        if i + 1 < len(keys) and keys[i + 1][0] > ta:
+            tb, xb, yb = keys[i + 1]
+            a = clamp((t - ta) / (tb - ta), 0.0, 1.0)
+            xa, ya = xa + (xb - xa) * a, ya + (yb - ya) * a
+        xs[k], ys[k] = map_xy(xa, ya)
+    smoothing = clamp(smoothing, 0.0, 1.0)
+    if smoothing > 0:
+        stiffness = 1400.0 * (1 - smoothing) + 90.0 * smoothing
+        for series in (xs, ys):
+            for order in (range(count), range(count - 1, -1, -1)):
+                sp = None
+                for k in order:
+                    if sp is None:
+                        sp = Spring(series[k], stiffness)
+                    series[k] = sp.step(series[k], dt)
+    for n in range(n_frames):
+        t = n / fps + offset
+        if t < t_first:
             continue
-        if held is None or math.hypot(pos[0] - held[0], pos[1] - held[1]) > jitter:
-            held = pos
-        if sx is None:
-            sx, sy = Spring(pos[0], stiffness), Spring(pos[1], stiffness)
-        if smoothing <= 0:
-            out.append(held)
-        else:
-            out.append((sx.step(held[0], dt), sy.step(held[1], dt)))
+        k = int(round((t - t0) / dt))
+        if 0 <= k < count:
+            out[n] = (xs[k], ys[k])
     return out
 
 
@@ -325,6 +550,25 @@ def position_at(cursor, t, fps):
     return next((p for p in cursor[n:] if p is not None), None)
 
 
+def explicit_focus(zoom, clicks, cursor, fps, w, h):
+    """Focus points for a zoom set in the editor: its anchor, then every click
+    inside it when it follows the cursor."""
+    focus = [(zoom["start"], zoom["x"] * w, zoom["y"] * h)]
+    if zoom["follow"]:
+        for t in clicks:
+            p = position_at(cursor, t, fps) if zoom["start"] < t < zoom["end"] else None
+            if p is not None:
+                focus.append((t, p[0], p[1]))
+    return focus
+
+
+def cursor_track_json(cursor, fps, w, h, rate=10):
+    """Cursor positions as [t, x, y] (0..1) at a coarse rate, for the editor."""
+    step = max(1, int(round(fps / rate)))
+    return [[round(n / fps, 2), round(p[0] / w, 4), round(p[1] / h, 4)]
+            for n, p in ((n, cursor[n]) for n in range(0, len(cursor), step)) if p is not None]
+
+
 def zoom_segments(focus_times, key_times, duration, cursor, fps, zoom):
     """Zoom segments: {"start", "end", "zoom", "focus": [(t, x, y), ...]}.
 
@@ -367,6 +611,73 @@ def zoom_segments(focus_times, key_times, duration, cursor, fps, zoom):
     return out
 
 
+def thumbnail(video, t, gw, gh):
+    """Grayscale gw x gh frame at t, or None."""
+    try:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", video, "-frames:v", "1",
+                            "-vf", f"scale={gw}:{gh},format=gray", "-f", "rawvideo", "-"],
+                           capture_output=True, timeout=20, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if len(r.stdout) == gw * gh else None
+
+
+def frame_center_x(gray, gw, gh, fx, fy, hw, hh, w, h):
+    """Center x for a zoom on (fx, fy) whose half view is hw x hh (work px).
+    If centring on the point would cut through content on the left (the start
+    of lines of text), move the view left to just before that content, as long
+    as the point stays comfortably in view."""
+    kx, ky = gw / w, gh / h
+    left = clamp(fx - hw, 0.0, w - 2 * hw)
+    if left <= 0:
+        return fx
+    y0, y1 = int(clamp((fy - hh) * ky, 0, gh - 1)), int(clamp((fy + hh) * ky, 1, gh))
+    band = [gray[y * gw:(y + 1) * gw] for y in range(y0, y1)]
+    sample = sorted(row[x] for row in band[::4] for x in range(0, gw, 4))
+    if not sample:
+        return fx
+    bg = sample[len(sample) // 2]
+    need = max(3, int((y1 - y0) * 0.06))
+
+    def ink(col):
+        return sum(1 for row in band if abs(row[col] - bg) > 28) >= need
+
+    c = int(left * kx)
+    if not any(ink(x) for x in range(max(0, c - 1), min(gw, c + 2))):
+        return fx
+    lo = int(max(0.0, fx - 2 * hw * 0.85) * kx)
+    gutter = max(3, int(2 * hw * kx * FRAME_GUTTER))
+    # the furthest-left content start in reach, so columns inside a table
+    # don't count as the start of the lines
+    run, start = 0, None
+    for col in range(c, lo - 1, -1):
+        run = run + 1 if not ink(col) else 0
+        if run == gutter or (col == 0 and 0 < run < gutter):
+            start = col + run
+    if start is None or start > c:
+        return fx
+    new_left = max(start / kx - 2 * hw * FRAME_MARGIN, fx - 2 * hw * 0.85, 0.0)
+    return new_left + hw
+
+
+def frame_segments(video, segments, w, h, view, explicit):
+    """Nudge each zoom's focus points so the zoomed view doesn't cut off the
+    start of text. An editor zoom's own anchor is left where the user put it."""
+    gw = 480
+    gh = max(2, int(round(gw * h / w)))
+    budget = 120
+    for seg in segments:
+        hw, hh = view[0] / (2 * seg["zoom"]), view[1] / (2 * seg["zoom"])
+        for i, (t, fx, fy) in enumerate(seg["focus"]):
+            if (explicit and i == 0) or budget <= 0:
+                continue
+            budget -= 1
+            gray = thumbnail(video, t, gw, gh)
+            if gray is not None:
+                seg["focus"][i] = (t, frame_center_x(gray, gw, gh, fx, fy, hw, hh, w, h), fy)
+    return segments
+
+
 def zoom_amount(t, seg):
     """0..1: how far into seg's zoom the camera is at time t."""
     rise = ease_in_out((t - seg["start"]) / ZOOM_IN)
@@ -384,7 +695,10 @@ def camera_path(cursor, n_frames, fps, w, h, view, segments, fill):
     mid = (w / 2, h / 2)
     base_x, base_y = Spring(mid[0], 6.0), Spring(mid[1], 6.0)
     base_target = list(mid)
+    # the pan target goes through a stiffer spring first, so pans ease in as
+    # well as out instead of setting off at full speed
     pan_x, pan_y = Spring(mid[0], PAN_STIFFNESS), Spring(mid[1], PAN_STIFFNESS)
+    aim_x, aim_y = Spring(mid[0], PAN_STIFFNESS * 3), Spring(mid[1], PAN_STIFFNESS * 3)
     target = mid
     seg_i, entered = 0, -1
     out = []
@@ -407,15 +721,15 @@ def camera_path(cursor, n_frames, fps, w, h, view, segments, fill):
             if entered != seg_i:
                 entered = seg_i
                 target = seg["focus"][0][1:3]
-                pan_x.value, pan_y.value = target
-                pan_x.velocity = pan_y.velocity = 0.0
+                for sp, v in ((pan_x, target[0]), (pan_y, target[1]), (aim_x, target[0]), (aim_y, target[1])):
+                    sp.value, sp.velocity = v, 0.0
             hw, hh = vw0 / (2 * seg["zoom"]), vh0 / (2 * seg["zoom"])
             for ft, fx, fy in seg["focus"]:
                 if 0 <= t - ft < dt and (abs(fx - target[0]) > hw * (1 - DEADZONE) or abs(fy - target[1]) > hh * (1 - DEADZONE)):
                     target = (fx, fy)
-            if pos is not None and (abs(pos[0] - target[0]) > hw * (1 - DEADZONE) or abs(pos[1] - target[1]) > hh * (1 - DEADZONE)):
+            if seg.get("follow", True) and pos is not None and (abs(pos[0] - target[0]) > hw * (1 - DEADZONE) or abs(pos[1] - target[1]) > hh * (1 - DEADZONE)):
                 target = (target[0] + (pos[0] - target[0]) * 0.85, target[1] + (pos[1] - target[1]) * 0.85)
-        px, py = pan_x.step(target[0], dt), pan_y.step(target[1], dt)
+        px, py = pan_x.step(aim_x.step(target[0], dt), dt), pan_y.step(aim_y.step(target[1], dt), dt)
         # blend from the base view to the pan target as the zoom comes in, so
         # zooming reads as one move toward the point rather than zoom-then-pan
         s = (z - 1.0) / (seg["zoom"] - 1.0) if seg and seg["zoom"] > 1.0 else 0.0
@@ -425,6 +739,33 @@ def camera_path(cursor, n_frames, fps, w, h, view, segments, fill):
         cy = clamp(cy, vh / 2, h - vh / 2)
         out.append((cx - vw / 2, cy - vh / 2, vw, vh))
     return out
+
+
+def camera_keyframed(camera, step):
+    """The viewport per frame as the renderer applies it: sampled every `step`
+    frames and linearly interpolated (see piecewise_expr)."""
+    n = len(camera)
+    out = []
+    for i in range(n):
+        a = (i // step) * step
+        b = min(a + step, n - 1)
+        if b <= a:
+            out.append(camera[a])
+            continue
+        f = (i - a) / (b - a)
+        out.append(tuple(p + (q - p) * f for p, q in zip(camera[a], camera[b], strict=True)))
+    return out
+
+
+def to_output(states, camera, out_w, out_h):
+    """Move sprite states from work px into the zoomed, scaled output video."""
+    res = []
+    for st, (left, top, vw, vh) in zip(states, camera, strict=True):
+        if st is None:
+            res.append(None)
+            continue
+        res.append((st[0], st[1], (st[2] - left) * out_w / vw, (st[3] - top) * out_h / vh))
+    return res
 
 
 def blur_windows(camera, fps, out_w, canvas_h):
@@ -513,16 +854,26 @@ ARROW_OUTER = [(0, 0), (0, 22.4), (5.4, 17.1), (9.0, 25.2), (12.9, 23.5), (9.4, 
 ARROW_INNER = [(1.6, 3.8), (1.6, 18.6), (5.9, 14.4), (9.8, 23.0), (11.0, 22.5), (7.1, 13.9), (12.9, 13.9)]
 
 
-def cursor_tile(w, h, pad, unit):
-    """RGBA (premultiplied-free) pixels of the arrow at `unit` px per design unit,
-    tip at (pad, pad): black body, white outline, soft drop shadow."""
+# text cursor (I-beam); its hotspot is the middle of the stem
+IBEAM_OUTER = [(0.3, 0), (8.7, 0), (8.7, 4.0), (6.5, 4.0), (6.5, 18.0), (8.7, 18.0), (8.7, 22.0),
+               (0.3, 22.0), (0.3, 18.0), (2.5, 18.0), (2.5, 4.0), (0.3, 4.0)]
+IBEAM_INNER = [(1.5, 1.2), (7.5, 1.2), (7.5, 2.8), (5.3, 2.8), (5.3, 19.2), (7.5, 19.2), (7.5, 20.8),
+               (1.5, 20.8), (1.5, 19.2), (3.7, 19.2), (3.7, 2.8), (1.5, 2.8)]
+IBEAM_HOT = (4.5, 11.0)
+SHAPES = {"arrow": (ARROW_OUTER, ARROW_INNER, (0.0, 0.0)), "ibeam": (IBEAM_OUTER, IBEAM_INNER, IBEAM_HOT)}
+
+
+def cursor_tile(w, h, pad, unit, shape="arrow"):
+    """RGBA (premultiplied-free) pixels of a cursor shape at `unit` px per design
+    unit, drawn from (pad, pad): black body, white outline, soft drop shadow."""
     ss = 3
-    outer = [(x * unit + pad, y * unit + pad) for x, y in ARROW_OUTER]
-    inner = [(x * unit + pad, y * unit + pad) for x, y in ARROW_INNER]
+    poly_o, poly_i, _ = SHAPES[shape]
+    outer = [(x * unit + pad, y * unit + pad) for x, y in poly_o]
+    inner = [(x * unit + pad, y * unit + pad) for x, y in poly_i]
     cover_o = [0.0] * (w * h)
     cover_i = [0.0] * (w * h)
-    x_max = 17 * unit + pad + 1
-    y_max = 25.5 * unit + pad + 1
+    x_max = max(x for x, _ in poly_o) * unit + pad + 1
+    y_max = max(y for _, y in poly_o) * unit + pad + 1
     for py in range(h):
         if py > y_max:
             break
@@ -570,17 +921,31 @@ def cursor_tile(w, h, pad, unit):
     return px_out
 
 
-def make_cursor_sheet(path, size_px):
-    """Sprite sheet: rows are press scales (SCALES), columns alpha levels.
-    Returns (tile_w, tile_h, hotspot) — the hotspot is the same in every tile."""
+def cursor_levels(grow_max):
+    """Cursor sizes in the sprite sheet: LEVEL_STEP apart, from a full click
+    squish up to the largest zoomed size, including 1.0 exactly."""
+    lo = int(math.floor(math.log(PRESS_SCALE) / math.log(LEVEL_STEP)))
+    hi = int(math.ceil(math.log(max(1.0, grow_max)) / math.log(LEVEL_STEP)))
+    return [LEVEL_STEP ** k for k in range(lo, hi + 1)]
+
+
+def make_cursor_sheet(path, size_px, levels, shapes=("arrow",)):
+    """Sprite sheet: one row per (shape, size level), columns alpha levels.
+    Returns (tile_w, tile_h, pad, rows) where rows[(shape, level_index)] is
+    (row, dx, dy): the tile's hotspot sits at (pad + dx, pad + dy)."""
     unit = size_px / 25.2
     pad = max(2, int(round(3 * unit)))
-    tw = int(math.ceil(17 * unit)) + pad * 2 + 2
-    th = int(math.ceil(25.5 * unit)) + pad * 2 + 2
-    sw, sh = tw * ALPHAS, th * len(SCALES)
+    top = max(levels)
+    tw = int(math.ceil(17 * unit * top)) + pad * 2 + 2
+    th = int(math.ceil(25.5 * unit * top)) + pad * 2 + 2
+    plan = [(shape, li, lv) for shape in shapes for li, lv in enumerate(levels)]
+    sw, sh = tw * ALPHAS, th * len(plan)
     rgba = bytearray(sw * sh * 4)
-    for row, scale in enumerate(SCALES):
-        tile = cursor_tile(tw, th, pad, unit * scale)
+    rows = {}
+    for row, (shape, li, scale) in enumerate(plan):
+        hx, hy = SHAPES[shape][2]
+        rows[(shape, li)] = (row, hx * unit * scale, hy * unit * scale)
+        tile = cursor_tile(tw, th, pad, unit * scale, shape)
         for col in range(ALPHAS):
             alpha = col / (ALPHAS - 1)
             for y in range(th):
@@ -590,7 +955,24 @@ def make_cursor_sheet(path, size_px):
                     k = base + x * 4
                     rgba[k:k + 4] = bytes((c, c, c, int(round(a * alpha * 255))))
     write_png(path, sw, sh, rgba)
-    return tw, th, pad
+    return tw, th, pad, rows
+
+
+def pick_tiles(states, zooms, shapes, levels, rows):
+    """Turn (alpha_col, squish, x, y) states into (col, row, x, y) sprite
+    states: the size row follows the click squish and the camera zoom."""
+    logs = [math.log(lv) for lv in levels]
+    out = []
+    for n, st in enumerate(states):
+        if st is None:
+            out.append(None)
+            continue
+        size = st[1] * min(CURSOR_GROW_MAX, zooms[n] ** ZOOM_CURSOR)
+        ls = math.log(size)
+        li = min(range(len(levels)), key=lambda i: abs(logs[i] - ls))
+        row, dx, dy = rows.get((shapes[n], li)) or rows[("arrow", li)]
+        out.append((st[0], row, st[2] - dx, st[3] - dy))
+    return out
 
 
 def make_ring_sheet(path, radius_px, width_px):
@@ -618,7 +1000,8 @@ def make_ring_sheet(path, radius_px, width_px):
 
 def cursor_track(smooth, raw, clicks_f, fps, w, h, scale, hide_idle, blur):
     """Per-frame sprite states for the cursor, two blur ghosts and the ring:
-    [(tile_col, tile_row, x, y) or None, ...] per layer."""
+    [(alpha_col, squish, x, y) or None, ...] per cursor layer, and
+    [(ring_frame, 0, x, y) or None, ...] for the ring."""
     n_frames = len(smooth)
     alpha, last_move, anchor = 0.0, -1e9, None
     press_i = ring_i = 0
@@ -651,7 +1034,7 @@ def cursor_track(smooth, raw, clicks_f, fps, w, h, scale, hide_idle, blur):
                 squish = 1 - (1 - PRESS_SCALE) * ease_out(d / PRESS_DOWN)
             elif d < PRESS_DOWN + PRESS_UP:
                 squish = PRESS_SCALE + (1 - PRESS_SCALE) * ease_out((d - PRESS_DOWN) / PRESS_UP)
-        row = min(range(len(SCALES)), key=lambda i: abs(SCALES[i] - squish))
+        row = squish
         col = int(round(alpha * (ALPHAS - 1)))
         main.append((col, row, pos[0], pos[1]) if col > 0 and pos is not None else None)
 
@@ -810,6 +1193,26 @@ def make_mask(path, w, h, radius):
                 "-vf", f"geq=lum='255*clip(0.5-{sdf},0,1)'", "-frames:v", "1", path], "drawing the rounded mask")
 
 
+def make_bubble(path, d, border):
+    """White ring plus soft shadow drawn around a d x d webcam circle; returns the padding."""
+    pad = int(math.ceil(d * 0.12))
+    size = d + 2 * pad
+    c = size / 2
+    r = d / 2
+    rgba = bytearray(size * size * 4)
+    for y in range(size):
+        for x in range(size):
+            dist = math.hypot(x + 0.5 - c, y + 0.5 - c - d * 0.02)
+            shadow = 0.5 * math.exp(-((max(0.0, dist - r) / (d * 0.05)) ** 2))
+            ring = clamp(r + border + 0.5 - math.hypot(x + 0.5 - c, y + 0.5 - c), 0.0, 1.0)
+            a = ring + shadow * (1 - ring)
+            v = int(255 * ring / a) if a > 0 else 0
+            k = (y * size + x) * 4
+            rgba[k:k + 4] = bytes((v, v, v, int(a * 255)))
+    write_png(path, size, size, rgba)
+    return pad
+
+
 # ------------------------------------------------------------------ layout
 
 def canvas_size(fmt, size, w, h):
@@ -891,7 +1294,12 @@ def render(opts):
     gif = opts.export == "gif"
 
     # Work resolution/frame rate: everything (camera, cursor) is computed in this space.
-    fps = min(src_fps, 30.0) if preview else src_fps
+    if opts.fps:
+        fps = clamp(opts.fps, 10.0, 120.0)
+    elif preview:
+        fps = min(src_fps, 30.0)
+    else:
+        fps = max(src_fps, 60.0)
     if gif:
         fps = min(fps, 30.0)
     ws = 0.5 if preview and min(src_w, src_h) >= 720 else 1.0
@@ -900,7 +1308,14 @@ def render(opts):
 
     events_path = opts.events or default_events_path(video)
     have_events = os.path.isfile(events_path)
-    out = os.path.abspath(opts.out or output_path(video, opts))
+    edits_path = opts.edits or sidecar(video, ".edit.json")
+    edits = clean_edits(None if opts.no_edits else load_json(edits_path, "edits"), duration)
+    session = load_json(sidecar(video, ".session.json"), "session") or {}
+    pieces = timeline_pieces(edits, duration)
+    edited = pieces != [(0.0, duration, 1.0)]
+    out_duration = sum((b - a) / r for a, b, r in pieces)
+    plan_only = opts.cmd == "plan"
+    out = os.path.abspath(opts.out or output_path(video, opts)) if not plan_only else None
     if out == video:
         raise RenderError("usage", "--out must differ from the input video")
 
@@ -932,21 +1347,21 @@ def render(opts):
 
     cursor = [None] * n_frames
     raw = [None] * n_frames
+    shapes = ["arrow"] * n_frames
     segments, clicks_v = [], []
     cursor_scale = ws
     if have_events:
         meta, moves, clicks, keys, end = load_events(events_path)
         region = meta["region"]
         sx, sy = w / float(region["w"]), h / float(region["h"])
-        # The tracker's end mark is written as the recorder is told to stop, so
-        # aligning ends absorbs the recorder's variable start-up delay.
-        offset = (end - duration) if end is not None else 0.0
+        offset = capture_offset(meta, session, end, duration)
 
         def map_xy(x, y):
             return (x - region["x"]) * sx, (y - region["y"]) * sy
 
         raw = sample_cursor(moves, n_frames, fps, offset, map_xy)
-        cursor = smooth_cursor(raw, fps, clamp(opts.smoothing, 0.0, 1.0), JITTER * sx)
+        cursor = smooth_cursor(moves, n_frames, fps, offset, map_xy, opts.smoothing, JITTER)
+        shapes = cursor_shapes(cursor, load_windows(events_path), fps, offset, map_xy)
         clicks_v = [t - offset for t in clicks if 0 <= t - offset < duration]
         keys_v = [t - offset for t in keys if 0 <= t - offset < duration]
         focus = clicks_v if (clicks_v or meta.get("input") == "evdev") else dwell_points(raw, fps, sx)
@@ -956,6 +1371,30 @@ def render(opts):
     else:
         log(f"No events file ({events_path}); framing only.")
 
+    def seg_json(seg):
+        return {"start": round(seg["start"], 3), "end": round(seg["end"], 3), "zoom": seg["zoom"],
+                "x": round(seg["focus"][0][1] / w, 4), "y": round(seg["focus"][0][2] / h, 4),
+                "follow": seg.get("follow", True)}
+
+    auto_segments = [seg_json(sg) for sg in segments]
+    if edits["zooms"] is not None:
+        segments = [{"start": z["start"], "end": z["end"], "zoom": z["zoom"], "follow": z["follow"],
+                     "focus": explicit_focus(z, clicks_v, raw, fps, w, h)}
+                    for z in edits["zooms"] if z["zoom"] > 1.0]
+    cam_path = session.get("webcam")
+    cam_path = os.path.join(os.path.dirname(sidecar(video, "")), os.path.basename(cam_path)) if isinstance(cam_path, str) else None
+    has_webcam = bool(cam_path and os.path.isfile(cam_path))
+    tracks = session.get("audio") if isinstance(session.get("audio"), list) else []
+    split_audio = "system" in tracks and "mic" in tracks and info["audio_tracks"] >= len(tracks)
+    if plan_only:
+        return {"ok": True, "video": video, "duration": duration, "width": src_w, "height": src_h, "fps": src_fps,
+                "audio": info["audio"], "audioTracks": tracks if split_audio else (["mix"] if info["audio"] else []),
+                "webcam": has_webcam, "events": have_events, "autoSegments": auto_segments,
+                "segments": [seg_json(sg) for sg in segments], "edits": edits, "editsFile": edits_path,
+                "cursorTrack": cursor_track_json(raw, fps, w, h),
+                "outputDuration": out_duration}
+
+    segments = frame_segments(video, segments, w, h, view, edits["zooms"] is not None)
     camera = camera_path(cursor, n_frames, fps, w, h, view, segments, layout == "fill")
 
     encoder = opts.encoder
@@ -986,18 +1425,31 @@ def render(opts):
         draw_cursor = have_events and not opts.no_cursor and any(p is not None for p in cursor)
         next_input = 1
 
+        graph.append(f"{head}{','.join(pre)}[v0]")
+        step = max(1, int(round(fps / 15)))
+        out_vw, out_vh = (vid_w, vid_h) if pad > 0 else (cw, ch)
+        # The cursor is drawn after the zoom, at output resolution, so it stays
+        # sharp and moves in whole output pixels instead of magnified ones.
+        cursor_chain, pos_cmd = [], None
         if draw_cursor:
+            k0 = out_vw / view[0]
             sheet, ring_png = os.path.join(work, "cursor.png"), os.path.join(work, "ring.png")
-            tw, th, hot = make_cursor_sheet(sheet, 22 * cursor_scale * opts.cursor_scale)
-            ring_size = make_ring_sheet(ring_png, 16 * cursor_scale, 3 * cursor_scale)
+            zmax = max([sg["zoom"] for sg in segments] + [1.0])
+            levels = cursor_levels(min(CURSOR_GROW_MAX, zmax ** ZOOM_CURSOR))
+            used = ("arrow", "ibeam") if "ibeam" in shapes else ("arrow",)
+            tw, th, hot, rows = make_cursor_sheet(sheet, 22 * cursor_scale * opts.cursor_scale * k0, levels, used)
+            ring_size = make_ring_sheet(ring_png, 16 * cursor_scale * k0, 3 * cursor_scale * k0)
             clicks_f = sorted(int(round(t * fps)) for t in clicks_v)
             blur = opts.motion_blur and not preview and not gif
-            main, g1, g2, ring = cursor_track(cursor, raw, clicks_f, fps, w, h, cursor_scale,
-                                              opts.hide_idle, blur)
+            tracks_ = cursor_track(cursor, raw, clicks_f, fps, w, h, cursor_scale, opts.hide_idle, blur)
+            cam_eff = camera_keyframed(camera, step)
+            main, g1, g2, ring = (to_output(t_, cam_eff, out_vw, out_vh) for t_ in tracks_)
+            zooms = [view[0] / c[2] for c in cam_eff]
+            main, g1, g2 = (pick_tiles(t_, zooms, shapes, levels, rows) for t_ in (main, g1, g2))
             layers = [("ring", ring, ring_size, ring_size, ring_size / 2, ring_size / 2),
                       ("g2", g2, tw, th, hot, hot), ("g1", g1, tw, th, hot, hot),
                       ("cur", main, tw, th, hot, hot)]
-            layers = [ly for ly in layers if any(s is not None for s in ly[1])]
+            layers = [ly for ly in layers if any(s_ is not None for s_ in ly[1])]
             if layers:
                 crop_lines, pos_lines = sprite_commands(layers, fps)
                 crop_cmd, pos_cmd = os.path.join(work, "sprites.cmd"), os.path.join(work, "cursor.cmd")
@@ -1014,8 +1466,6 @@ def render(opts):
                     inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-i", sheet]
                     sheet_in = next_input
                     next_input += 1
-                pre.append(f"sendcmd=f='{pos_cmd}'")
-                graph.append(f"{head}{','.join(pre)}[v0]")
                 sprite_streams = {}
                 # one sendcmd reaches every filter in the graph; it sits on a
                 # sprite stream so tile changes land on the matching sprite frame
@@ -1033,19 +1483,26 @@ def render(opts):
                     for name in names:
                         graph.append(f"[sh_{name}]crop@{name}=w={tw}:h={th}:x=0:y=0[sp_{name}]")
                         sprite_streams[name] = f"[sp_{name}]"
-                for i, ly in enumerate(layers):
-                    dst = f"[c{i}]"
-                    graph.append(f"{src}{sprite_streams[ly[0]]}overlay@{ly[0]}=x={OFF}:y={OFF}:shortest=1{dst}")
-                    src = dst
+                cursor_chain = [(ly[0], sprite_streams[ly[0]]) for ly in layers]
             else:
                 draw_cursor = False
-        if not graph:
-            graph.append(f"{head}{','.join(pre)}[v0]")
+
+        def scaled(src, sw, sh):
+            """Scale the (zoomed) screen to its output size and draw the cursor on it."""
+            chain = f"scale={sw}:{sh}:flags=lanczos"
+            if not cursor_chain:
+                graph.append(f"{src}{chain}[sv]")
+                return "[sv]"
+            graph.append(f"{src}{chain},format=yuv420p,sendcmd=f='{pos_cmd}'[sv]")
+            src = "[sv]"
+            for i, (name, stream) in enumerate(cursor_chain):
+                graph.append(f"{src}{stream}overlay@{name}=x={OFF}:y={OFF}:shortest=1[cv{i}]")
+                src = f"[cv{i}]"
+            return src
 
         full = all(abs(l0) < 0.5 and abs(t0) < 0.5 and abs(vw - w) < 0.5 and abs(vh - h) < 0.5
                    for l0, t0, vw, vh in camera)
         if not full:
-            step = max(1, int(round(fps / 15)))
             left = [c[0] for c in camera]
             top = [c[1] for c in camera]
             right = [c[0] + c[2] - w for c in camera]
@@ -1055,7 +1512,7 @@ def render(opts):
             graph.append(f"{src}perspective=x0='{L}':y0='{T}':x1='{R}':y1='{T}':x2='{L}':y2='{B}':x3='{R}':y3='{B}'"
                          f":interpolation=cubic:eval=frame[z]")
             src = "[z]"
-            windows = blur_windows(camera, fps, vid_w, ch) if opts.motion_blur and not preview and not gif else []
+            windows = blur_windows(camera, fps, vid_w, ch) if opts.camera_blur and opts.motion_blur and not preview and not gif else []
             if windows:
                 enable = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in windows)
                 graph.append(f"{src}split[za][zb];[zb]tmix=frames=3:weights='1 2 1'[zbl];"
@@ -1070,13 +1527,79 @@ def render(opts):
             inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-i", backdrop,
                        "-loop", "1", "-framerate", f"{fps:g}", "-i", mask]
             b, m = next_input, next_input + 1
-            graph.append(f"{src}scale={vid_w}:{vid_h}:flags=lanczos,format=yuva420p[c0v]")
+            src = scaled(src, vid_w, vid_h)
+            graph.append(f"{src}format=yuva420p[c0v]")
             graph.append(f"[{m}:v]format=gray[mk]")
             graph.append("[c0v][mk]alphamerge[c1v]")
             graph.append(f"[{b}:v]format=yuv420p[bgv]")
-            graph.append(f"[bgv][c1v]overlay={vid_x}:{vid_y}:shortest=1:format=auto,format=yuv420p[out]")
+            graph.append(f"[bgv][c1v]overlay={vid_x}:{vid_y}:shortest=1:format=auto[comp]")
+            next_input += 2
         else:
-            graph.append(f"{src}scale={cw}:{ch}:flags=lanczos,format=yuv420p[out]")
+            src = scaled(src, cw, ch)
+            graph.append(f"{src}null[comp]")
+        src = "[comp]"
+
+        cam = edits["webcam"]
+        use_webcam = has_webcam and cam["enabled"] and not opts.no_webcam
+        if use_webcam:
+            cam_info = probe(cam_path)
+            lead = webcam_lead(session, cam_info["duration"], duration)
+            d = even(min(cw, ch) * cam["size"])
+            margin = int(round(min(cw, ch) * 0.045))
+            border = max(2, int(round(d * 0.025)))
+            x = margin if cam["corner"] in ("bl", "tl") else cw - margin - d
+            y = margin if cam["corner"] in ("tl", "tr") else ch - margin - d
+            frame_png, cmask = os.path.join(work, "bubble.png"), os.path.join(work, "bubble-mask.png")
+            fpad = make_bubble(frame_png, d, border)
+            make_mask(cmask, d, d, d / 2)
+            if lead < 0:
+                inputs += ["-itsoffset", f"{-lead:.3f}"]
+            inputs += ["-i", cam_path, "-loop", "1", "-framerate", f"{fps:g}", "-i", frame_png,
+                       "-loop", "1", "-framerate", f"{fps:g}", "-i", cmask]
+            ci, fi, mi = next_input, next_input + 1, next_input + 2
+            next_input += 3
+            trim = f"trim=start={lead:.3f},setpts=PTS-STARTPTS," if lead > 0 else ""
+            graph.append(f"[{ci}:v]{trim}fps={fps:g},{'hflip,' if cam['mirror'] else ''}"
+                         f"scale={d}:{d}:force_original_aspect_ratio=increase,crop={d}:{d},format=yuva420p[cam0]")
+            graph.append(f"[{mi}:v]format=gray[cmk]")
+            graph.append("[cam0][cmk]alphamerge[cam1]")
+            graph.append(f"{src}[{fi}:v]overlay={x - fpad}:{y - fpad}:shortest=1[bub]")
+            graph.append(f"[bub][cam1]overlay={x}:{y}:eof_action=pass[wc]")
+            src = "[wc]"
+
+        vol = edits["audio"]
+        sys_v = opts.system_volume if opts.system_volume is not None else vol["system"]
+        mic_v = opts.mic_volume if opts.mic_volume is not None else vol["mic"]
+        denoise = opts.denoise or vol["denoise"]
+        audio_label = None
+        if info["audio"] and not gif:
+            if split_audio:
+                si, mi_ = tracks.index("system"), tracks.index("mic")
+                graph.append(f"[0:a:{si}]volume={sys_v:.3f}[as]")
+                graph.append(f"[0:a:{mi_}]{'afftdn=nf=-25,' if denoise else ''}volume={mic_v:.3f}[am]")
+                graph.append("[as][am]amix=inputs=2:normalize=0:duration=longest[aud]")
+                audio_label = "[aud]"
+            elif edited or abs(sys_v - 1) > 1e-3 or denoise:
+                graph.append(f"[0:a:0]{'afftdn=nf=-25,' if denoise else ''}volume={sys_v:.3f}[aud]")
+                audio_label = "[aud]"
+        if edited:
+            n = len(pieces)
+            graph.append(f"{src}split={n}" + "".join(f"[pv{i}]" for i in range(n)) if n > 1 else f"{src}null[pv0]")
+            if audio_label:
+                graph.append(f"{audio_label}asplit={n}" + "".join(f"[pa{i}]" for i in range(n)) if n > 1 else f"{audio_label}anull[pa0]")
+            cat = []
+            for i, (a, b, r) in enumerate(pieces):
+                graph.append(f"[pv{i}]trim=start={a:.3f}:end={b:.3f},setpts=(PTS-STARTPTS)/{r:.4f}[qv{i}]")
+                cat.append(f"[qv{i}]")
+                if audio_label:
+                    graph.append(f"[pa{i}]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS,{atempo(r)}[qa{i}]")
+                    cat.append(f"[qa{i}]")
+            graph.append("".join(cat) + f"concat=n={n}:v=1:a={1 if audio_label else 0}[catv]" + ("[cata]" if audio_label else ""))
+            graph.append(f"[catv]fps={fps:g}[ed]")
+            src = "[ed]"
+            if audio_label:
+                audio_label = "[cata]"
+        graph.append(f"{src}format=yuv420p[out]")
 
         script = os.path.join(work, "graph.txt")
         with open(script, "w") as f:
@@ -1084,9 +1607,11 @@ def render(opts):
 
         head_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-y"]
         tail = ["-map", "[out]"]
-        if info["audio"] and not gif:
-            tail += ["-map", "0:a?", "-c:a", "copy"]
-        tail += ["-r", f"{fps:g}", "-t", f"{duration:.3f}"]
+        if audio_label:
+            tail += ["-map", audio_label, "-c:a", "aac", "-b:a", "192k"]
+        elif info["audio"] and not gif:
+            tail += ["-map", "0:a:0", "-c:a", "copy"]
+        tail += ["-r", f"{fps:g}", "-t", f"{out_duration:.3f}"]
         if gif:
             mid = os.path.join(work, "gif-source.mp4")
             tmp_out = mid
@@ -1109,7 +1634,7 @@ def render(opts):
                 f.write(";\n".join(graph[:-1] + [graph[-1].replace("format=yuv420p[out]", "format=nv12,hwupload[out]")]))
             qp = "28" if preview else str(max(10, opts.crf + 2))
             err = encode(head_cmd + ["-vaapi_device", device] + inputs, vgraph,
-                         tail + ["-c:v", "h264_vaapi", "-qp", qp], tmp_out, duration, span)
+                         tail + ["-c:v", "h264_vaapi", "-qp", qp], tmp_out, out_duration, span)
             if err:
                 if opts.encoder == "vaapi":
                     raise RenderError("ffmpeg_failed", f"VAAPI encode failed: {err}")
@@ -1117,7 +1642,7 @@ def render(opts):
                 encoder = "x264"
                 err = None
         if encoder == "x264" or gif:
-            err = encode(head_cmd + inputs, script, tail + x264_args(), tmp_out, duration, span)
+            err = encode(head_cmd + inputs, script, tail + x264_args(), tmp_out, out_duration, span)
         if err:
             raise RenderError("ffmpeg_failed", f"ffmpeg failed while rendering: {err}")
 
@@ -1140,9 +1665,9 @@ def render(opts):
             os.replace(tmp_out, out)
         if not JSON_MODE:
             print("\r100%", file=sys.stderr)
-        seg_out = [{"start": round(s["start"], 3), "end": round(s["end"], 3), "zoom": s["zoom"],
-                    "x": round(s["focus"][0][1] / w, 4), "y": round(s["focus"][0][2] / h, 4)} for s in segments]
-        return {"ok": True, "file": out, "duration": duration, "zooms": len(segments), "segments": seg_out,
+        seg_out = [seg_json(sg) for sg in segments]
+        return {"ok": True, "file": out, "duration": out_duration, "zooms": len(segments), "segments": seg_out,
+                "edited": edited, "webcam": use_webcam, "audioMix": bool(audio_label),
                 "cursor": draw_cursor, "encoder": "gif" if gif else encoder,
                 "format": opts.format, "layout": layout, "size": [cw, ch],
                 "events": events_path if have_events else None}
@@ -1161,8 +1686,15 @@ def main():
     global JSON_MODE
     parser = argparse.ArgumentParser(prog="creator-mode-studio", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("render", help="render the studio cut of a recording")
+    common = argparse.ArgumentParser(add_help=False)
+    r = common
     r.add_argument("video")
+    r.add_argument("--edits", help="timeline edits (default: .creator-mode/<name>.edit.json when it exists)")
+    r.add_argument("--no-edits", action="store_true", help="ignore the edit file")
+    r.add_argument("--no-webcam", action="store_true", help="leave out the webcam bubble")
+    r.add_argument("--system-volume", type=float, help="desktop audio gain (default from edits, else 1)")
+    r.add_argument("--mic-volume", type=float, help="microphone gain, for recordings with a separate mic track")
+    r.add_argument("--denoise", action="store_true", help="reduce background noise on the microphone")
     r.add_argument("--events", help="events file (default: next to the video in .creator-mode/)")
     r.add_argument("--out", help="output file (default: <video>-studio[-FORMAT][-preview].mp4|gif)")
     r.add_argument("--zoom", type=float, default=1.8, help="zoom level on clicks; 1 disables zoom (default 1.8)")
@@ -1184,15 +1716,21 @@ def main():
                    help="preview renders at half size and 30 fps without motion blur")
     r.add_argument("--encoder", default="auto", choices=("auto", "x264", "vaapi"),
                    help="auto uses VAAPI when a test encode works, else x264")
+    r.add_argument("--fps", type=float,
+                   help="output frame rate (default: 60 or the source's if higher; preview 30)")
     r.add_argument("--smoothing", type=float, default=0.55, help="cursor smoothing 0..1 (default 0.55)")
     r.add_argument("--hide-idle", type=float, default=2.5, help="hide the cursor after N idle seconds; 0 never")
     r.add_argument("--cursor-scale", type=float, default=1.4, help="cursor size multiplier (default 1.4)")
     r.add_argument("--no-cursor", action="store_true", help="don't draw a cursor")
     r.add_argument("--no-motion-blur", dest="motion_blur", action="store_false")
+    r.add_argument("--camera-blur", action="store_true",
+                   help="also blur fast zoom/pan moves (frame blending; can ghost at 30 fps)")
     r.add_argument("--preset", default="medium", help="x264 preset (default medium)")
     r.add_argument("--crf", type=int, default=18, help="x264 quality, lower is better (default 18)")
     r.add_argument("--json-progress", action="store_true", help="machine-readable progress on stdout")
     r.add_argument("--keep-temp", action="store_true", help=argparse.SUPPRESS)
+    sub.add_parser("render", parents=[common], help="render the studio cut of a recording")
+    sub.add_parser("plan", parents=[common], help="print the zoom plan and edits as JSON without rendering")
     opts = parser.parse_args()
     JSON_MODE = opts.json_progress
     signal.signal(signal.SIGTERM, interrupted)
@@ -1207,8 +1745,8 @@ def main():
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)
-    if JSON_MODE:
-        emit(result)
+    if JSON_MODE or opts.cmd == "plan":
+        print(json.dumps(result), flush=True)
     else:
         print(result["file"])
 

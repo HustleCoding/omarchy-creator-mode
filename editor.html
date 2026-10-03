@@ -1,0 +1,594 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Creator Mode · Timeline</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a22; --panel2: #1f2330; --line: #2a2f3d; --text: #e6e8ee; --muted: #8b91a3;
+    --accent: #7aa2f7; --cut: #f7768e; --speed: #e0af68; --zoom: #7aa2f7; --ok: #9ece6a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.4 "JetBrainsMono Nerd Font", "JetBrains Mono", ui-monospace, monospace; }
+  button, select, input { font: inherit; color: inherit; }
+  button { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 600; }
+  button.danger { color: var(--cut); }
+  select, input[type=number] { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
+  kbd { background: var(--panel2); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; font-size: 11px; color: var(--muted); }
+  .app { display: grid; grid-template-rows: auto 1fr auto; height: 100%; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  header .name { font-weight: 600; }
+  header .status { color: var(--muted); margin-left: auto; }
+  .main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; min-height: 0; }
+  .stage { display: flex; flex-direction: column; min-height: 0; padding: 14px; gap: 10px; }
+  .viewport { position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+  .frame { position: relative; overflow: hidden; border-radius: 10px; box-shadow: 0 10px 40px #0008; background: #000; }
+  .frame video { display: block; width: 100%; height: 100%; transform-origin: 0 0; }
+  .focus { position: absolute; border: 2px solid var(--zoom); border-radius: 4px; box-shadow: 0 0 0 9999px #0007; pointer-events: none; display: none; }
+  .focus::after { content: ""; position: absolute; left: 50%; top: 50%; width: 10px; height: 10px; margin: -5px; border-radius: 50%; background: var(--zoom); }
+  .frame.picking { cursor: crosshair; }
+  .transport { display: flex; align-items: center; gap: 8px; }
+  .transport .time { color: var(--muted); min-width: 140px; }
+  .transport .spacer { flex: 1; }
+  aside { border-left: 1px solid var(--line); overflow-y: auto; overflow-x: hidden; min-width: 0; padding: 12px 14px; display: flex; flex-direction: column; gap: 16px; }
+  aside h3 { margin: 0 0 8px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .row label { flex: 0 0 84px; color: var(--muted); }
+  .row input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); }
+  .row .val { flex: 0 0 40px; text-align: right; color: var(--muted); }
+  .row select, .row input[type=number] { flex: 1; min-width: 0; }
+  .hint { color: var(--muted); font-size: 12px; }
+  .bar { height: 6px; border-radius: 3px; background: var(--panel2); overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .result video, .result img { width: 100%; border-radius: 6px; margin-top: 8px; }
+  footer { border-top: 1px solid var(--line); padding: 8px 16px 14px; user-select: none; }
+  .tools { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .tools .hint { margin-left: auto; }
+  .timeline { position: relative; }
+  .ruler { position: relative; height: 18px; color: var(--muted); font-size: 10px; cursor: pointer; }
+  .ruler span { position: absolute; top: 0; border-left: 1px solid var(--line); padding-left: 3px; height: 100%; }
+  .track { position: relative; height: 30px; margin: 4px 0; border-radius: 6px; background: var(--panel); }
+  .track .label { position: absolute; left: -64px; width: 58px; text-align: right; top: 7px; color: var(--muted); font-size: 11px; }
+  .film { height: 56px; background-size: 100% 100%; background-repeat: no-repeat; cursor: pointer; overflow: hidden; }
+  .shade { position: absolute; top: 0; bottom: 0; background: #000b; pointer-events: none; }
+  .handle { position: absolute; top: -2px; bottom: -2px; width: 10px; margin-left: -5px; background: var(--accent); border-radius: 3px; cursor: ew-resize; z-index: 3; }
+  .sel { position: absolute; top: 0; bottom: 0; background: #fff2; border: 1px dashed #fff8; pointer-events: none; z-index: 2; }
+  .block { position: absolute; top: 3px; bottom: 3px; border-radius: 5px; padding: 0 8px; font-size: 11px; line-height: 24px; white-space: nowrap; overflow: hidden; cursor: grab; z-index: 2; }
+  .block .edge { position: absolute; top: 0; bottom: 0; width: 7px; cursor: ew-resize; }
+  .block .edge.l { left: 0; } .block .edge.r { right: 0; }
+  .block.zoom { background: color-mix(in srgb, var(--zoom) 35%, transparent); border: 1px solid var(--zoom); }
+  .block.speed { background: color-mix(in srgb, var(--speed) 30%, transparent); border: 1px solid var(--speed); }
+  .block.cut { background: repeating-linear-gradient(45deg, #f7768e55 0 6px, #f7768e22 6px 12px); border: 1px solid var(--cut); top: 0; bottom: 0; }
+  .block.auto { border-style: dashed; }
+  .block.selected { box-shadow: 0 0 0 2px var(--text); }
+  .playhead { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--text); pointer-events: none; z-index: 5; }
+  .tracks { margin-left: 64px; }
+  .error { color: var(--cut); }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <span class="name" id="name">Creator Mode</span>
+    <span class="hint" id="durations"></span>
+    <span class="status" id="status">Loading…</span>
+    <button id="undo" title="Undo (Ctrl+Z)">Undo</button>
+    <button id="close">Close editor</button>
+  </header>
+  <div class="main">
+    <section class="stage">
+      <div class="viewport" id="viewport">
+        <div class="frame" id="frame">
+          <video id="video" preload="auto" playsinline></video>
+          <div class="focus" id="focus"></div>
+        </div>
+      </div>
+      <div class="transport">
+        <button id="play" title="Play/pause (Space)">Play</button>
+        <span class="time" id="time">0:00.0 / 0:00.0</span>
+        <label class="hint"><input type="checkbox" id="previewZoom" checked> preview zooms</label>
+        <span class="spacer"></span>
+        <button id="setIn" title="Trim start here (I)">Trim start <kbd>I</kbd></button>
+        <button id="setOut" title="Trim end here (O)">Trim end <kbd>O</kbd></button>
+      </div>
+    </section>
+    <aside>
+      <div id="inspector">
+        <h3>Selection</h3>
+        <div class="hint" id="inspectorEmpty">Drag across the filmstrip to select a range, or click a block below it.</div>
+        <div id="inspectorBody"></div>
+      </div>
+      <div>
+        <h3>Look</h3>
+        <div class="row"><label>Background</label><select id="background"></select></div>
+        <div class="row"><label>Format</label><select id="format">
+          <option value="source">Source</option><option value="16:9">16:9 · YouTube</option>
+          <option value="9:16">9:16 · Shorts/Reels/TikTok</option><option value="1:1">1:1 · Square</option>
+          <option value="4:5">4:5 · Feed</option></select></div>
+      </div>
+      <div>
+        <h3>Audio</h3>
+        <div class="row"><label id="sysLabel">Desktop</label><input type="range" id="system" min="0" max="2" step="0.05"><span class="val" id="systemVal"></span></div>
+        <div class="row" id="micRow"><label>Microphone</label><input type="range" id="mic" min="0" max="2" step="0.05"><span class="val" id="micVal"></span></div>
+        <div class="row"><label>Noise</label><label style="flex:1;color:var(--text)"><input type="checkbox" id="denoise"> reduce background noise</label></div>
+        <div class="hint" id="audioHint"></div>
+      </div>
+      <div id="webcamBox">
+        <h3>Webcam</h3>
+        <div class="row"><label>Bubble</label><label style="flex:1;color:var(--text)"><input type="checkbox" id="camOn"> show</label>
+          <label style="color:var(--text)"><input type="checkbox" id="camMirror"> mirror</label></div>
+        <div class="row"><label>Corner</label><select id="camCorner">
+          <option value="br">Bottom right</option><option value="bl">Bottom left</option>
+          <option value="tr">Top right</option><option value="tl">Top left</option></select></div>
+        <div class="row"><label>Size</label><input type="range" id="camSize" min="0.1" max="0.45" step="0.01"><span class="val" id="camSizeVal"></span></div>
+      </div>
+      <div>
+        <h3>Render</h3>
+        <div class="row"><label>Export</label><select id="export"><option value="mp4">MP4</option><option value="gif">GIF</option></select></div>
+        <div class="row" style="gap:6px">
+          <button id="renderPreview">Quick preview</button>
+          <button id="renderFinal" class="primary">Render</button>
+          <button id="cancel" class="danger" hidden>Stop</button>
+        </div>
+        <div class="bar"><div id="progress"></div></div>
+        <div class="hint" id="renderStatus"></div>
+        <div class="result" id="result"></div>
+      </div>
+    </aside>
+  </div>
+  <footer>
+    <div class="tools">
+      <button id="cutSel" disabled title="Remove the selected range (X)">Cut <kbd>X</kbd></button>
+      <button id="speedSel" disabled title="Speed up the selected range (S)">Speed up <kbd>S</kbd></button>
+      <button id="zoomSel" title="Add a zoom on the selection or at the playhead (Z)">Add zoom <kbd>Z</kbd></button>
+      <button id="resetZooms" title="Go back to the automatic zooms">Auto zooms</button>
+      <button id="clearZooms" title="Remove every zoom">No zooms</button>
+      <span class="hint">Drag the filmstrip to select · drag blocks to move, edges to resize · <kbd>Del</kbd> removes</span>
+    </div>
+    <div class="timeline tracks" id="timeline">
+      <div class="ruler" id="ruler"></div>
+      <div class="track film" id="film"><span class="label">Video</span></div>
+      <div class="track" id="zoomTrack"><span class="label">Zoom</span></div>
+      <div class="track" id="speedTrack"><span class="label">Speed</span></div>
+      <div class="playhead" id="playhead"></div>
+    </div>
+  </footer>
+</div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+function showError(id, msg) { const el = $(id); el.textContent = ""; const s = document.createElement("span"); s.className = "error"; s.textContent = msg; el.appendChild(s); }
+const base = location.pathname.endsWith("/") ? location.pathname : location.pathname + "/";
+const video = $("video");
+const BACKGROUNDS = ["theme", "wallpaper", "midnight", "sunset", "ocean", "aurora", "candy", "peach", "dusk", "lime", "forest", "slate", "mono"];
+const ZOOM_IN = 0.75, ZOOM_OUT = 0.95, MIN = 0.1;
+let plan = null, ed = null, autoZooms = true, selected = null, range = null, history = [], saveTimer = null, polling = null;
+
+const fmt = (t) => { t = Math.max(0, t); const m = Math.floor(t / 60); return m + ":" + (t - m * 60).toFixed(1).padStart(4, "0"); };
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const ease = (p) => { p = clamp(p, 0, 1); return p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2; };
+const D = () => plan.duration;
+
+async function api(path, body) {
+  const res = await fetch(base + path, body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({ ok: false, message: res.statusText }));
+  if (!res.ok || data.ok === false) throw new Error(data.message || res.statusText);
+  return data;
+}
+
+function zooms() { return autoZooms ? plan.autoSegments : ed.zooms; }
+
+function snapshot() { history.push(JSON.stringify({ ed, autoZooms })); if (history.length > 100) history.shift(); }
+function undo() {
+  const s = history.pop(); if (!s) return;
+  const o = JSON.parse(s); ed = o.ed; autoZooms = o.autoZooms; selected = null; changed(false);
+}
+
+function ownZooms() {
+  if (autoZooms) { ed.zooms = plan.autoSegments.map((z) => ({ ...z })); autoZooms = false; }
+}
+
+function changed(record = true) {
+  drawTimeline(); drawInspector(); updateDurations();
+  $("status").textContent = "Unsaved…";
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(save, 400);
+}
+
+async function save() {
+  const body = { ...ed, zooms: autoZooms ? null : ed.zooms,
+    render: { background: $("background").value, format: $("format").value, export: $("export").value } };
+  try {
+    const p = await api("edits", body);
+    plan.outputDuration = p.outputDuration;
+    $("status").textContent = "Saved";
+    updateDurations();
+  } catch (e) { showError("status", "Save failed: " + e.message); }
+}
+
+function updateDurations() {
+  $("durations").textContent = "raw " + fmt(D()) + " → cut " + fmt(outputDuration());
+}
+
+function pieces() {
+  let ranges = [[ed.trim[0], ed.trim[1]]];
+  for (const [a, b] of ed.cuts) {
+    const next = [];
+    for (const [s, e] of ranges) {
+      if (b <= s || a >= e) { next.push([s, e]); continue; }
+      if (a > s) next.push([s, a]);
+      if (b < e) next.push([b, e]);
+    }
+    ranges = next;
+  }
+  return ranges;
+}
+function rateAt(t) { const s = ed.speed.find((s) => t >= s.start && t < s.end); return s ? s.rate : 1; }
+function outputDuration() {
+  let total = 0;
+  for (const [s, e] of pieces()) {
+    let cur = s;
+    for (const sp of ed.speed) {
+      const a = Math.max(sp.start, cur), b = Math.min(sp.end, e);
+      if (b <= a) continue;
+      total += (a - cur) + (b - a) / sp.rate; cur = b;
+    }
+    total += e - cur;
+  }
+  return total;
+}
+
+// ---------- timeline
+
+const X = (t) => (t / D() * 100) + "%";
+function timeAtEvent(ev) {
+  const r = $("film").getBoundingClientRect();
+  return clamp((ev.clientX - r.left) / r.width, 0, 1) * D();
+}
+
+function drawRuler() {
+  const el = $("ruler"); el.innerHTML = "";
+  const w = el.getBoundingClientRect().width || 800;
+  const steps = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
+  const step = steps.find((s) => w / (D() / s) > 60) || 600;
+  for (let t = 0; t <= D() + 1e-6; t += step) {
+    const s = document.createElement("span"); s.style.left = X(t); s.textContent = fmt(t).replace(/\.0$/, ""); el.appendChild(s);
+  }
+}
+
+function block(track, kind, item, index, text, auto) {
+  const b = document.createElement("div");
+  b.className = "block " + kind + (auto ? " auto" : "") + (selected && selected.kind === kind && selected.index === index ? " selected" : "");
+  b.style.left = X(item.start ?? item[0]); b.style.width = `calc(${X((item.end ?? item[1]) - (item.start ?? item[0]))})`;
+  b.textContent = text;
+  for (const side of ["l", "r"]) { const e = document.createElement("div"); e.className = "edge " + side; e.dataset.side = side; b.appendChild(e); }
+  b.addEventListener("pointerdown", (ev) => dragBlock(ev, kind, index, ev.target.dataset.side));
+  track.appendChild(b);
+}
+
+function drawTimeline() {
+  const film = $("film"), zt = $("zoomTrack"), st = $("speedTrack");
+  for (const el of [film, zt, st]) el.querySelectorAll(".block,.shade,.handle,.sel").forEach((n) => n.remove());
+  const sh = (a, b) => { const d = document.createElement("div"); d.className = "shade"; d.style.left = X(a); d.style.width = X(b - a); film.appendChild(d); };
+  sh(0, ed.trim[0]); sh(ed.trim[1], D());
+  ed.cuts.forEach((c, i) => block(film, "cut", c, i, "cut", false));
+  for (const [side, t] of [["in", ed.trim[0]], ["out", ed.trim[1]]]) {
+    const h = document.createElement("div"); h.className = "handle"; h.style.left = X(t); h.title = "Trim " + side;
+    h.addEventListener("pointerdown", (ev) => dragTrim(ev, side)); film.appendChild(h);
+  }
+  zooms().forEach((z, i) => block(zt, "zoom", z, i, z.zoom.toFixed(1) + "×" + (autoZooms ? " auto" : ""), autoZooms));
+  ed.speed.forEach((s, i) => block(st, "speed", s, i, s.rate + "×", false));
+  if (range) { const d = document.createElement("div"); d.className = "sel"; d.style.left = X(range[0]); d.style.width = X(range[1] - range[0]); film.appendChild(d); }
+  $("cutSel").disabled = $("speedSel").disabled = !range;
+}
+
+function drag(ev, onMove, onDone) {
+  ev.preventDefault(); ev.stopPropagation();
+  const t0 = timeAtEvent(ev);
+  let moved = false;
+  const move = (e) => { moved = true; onMove(timeAtEvent(e) - t0, timeAtEvent(e)); };
+  const up = (e) => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); onDone && onDone(moved, e); };
+  window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
+}
+
+function listFor(kind) { return kind === "cut" ? ed.cuts : kind === "speed" ? ed.speed : zooms(); }
+
+function dragBlock(ev, kind, index, side) {
+  if (kind === "zoom") ownZooms();
+  selected = { kind, index }; range = null;
+  const list = listFor(kind), item = list[index];
+  const get = (it) => kind === "cut" ? [it[0], it[1]] : [it.start, it.end];
+  const set = (it, a, b) => { if (kind === "cut") { it[0] = a; it[1] = b; } else { it.start = a; it.end = b; } };
+  const [a0, b0] = get(item);
+  snapshot();
+  drawTimeline(); drawInspector();
+  if (kind === "zoom") seek(Math.max(a0, Math.min(b0, video.currentTime)));
+  drag(ev, (dt) => {
+    let a = a0, b = b0;
+    if (side === "l") a = clamp(a0 + dt, 0, b0 - MIN);
+    else if (side === "r") b = clamp(b0 + dt, a0 + MIN, D());
+    else { const len = b0 - a0; a = clamp(a0 + dt, 0, D() - len); b = a + len; }
+    set(item, a, b); drawTimeline();
+  }, (moved) => { if (moved) { list.sort((p, q) => get(p)[0] - get(q)[0]); selected.index = list.indexOf(item); changed(); } else history.pop(); });
+}
+
+function dragTrim(ev, side) {
+  snapshot();
+  drag(ev, (_dt, t) => {
+    if (side === "in") ed.trim[0] = clamp(t, 0, ed.trim[1] - MIN); else ed.trim[1] = clamp(t, ed.trim[0] + MIN, D());
+    drawTimeline(); seek(side === "in" ? ed.trim[0] : ed.trim[1]);
+  }, (moved) => moved ? changed() : history.pop());
+}
+
+$("film").addEventListener("pointerdown", (ev) => {
+  const t0 = timeAtEvent(ev);
+  selected = null;
+  drag(ev, (_dt, t) => { range = [Math.min(t0, t), Math.max(t0, t)]; drawTimeline(); },
+    (moved) => {
+      if (!moved || (range && range[1] - range[0] < MIN)) { range = null; seek(t0); }
+      drawTimeline(); drawInspector();
+    });
+});
+$("ruler").addEventListener("pointerdown", (ev) => { seek(timeAtEvent(ev)); drag(ev, (_d, t) => seek(t)); });
+
+// ---------- actions
+
+function cutRange() {
+  if (!range) return; snapshot();
+  ed.cuts.push([range[0], range[1]]); ed.cuts.sort((a, b) => a[0] - b[0]);
+  range = null; selected = null; changed();
+}
+function speedRange() {
+  if (!range) return; snapshot();
+  ed.speed = ed.speed.filter((s) => s.end <= range[0] || s.start >= range[1]);
+  ed.speed.push({ start: range[0], end: range[1], rate: 2 }); ed.speed.sort((a, b) => a.start - b.start);
+  selected = { kind: "speed", index: ed.speed.findIndex((s) => s.start === range[0]) }; range = null; changed();
+}
+function cursorAt(t) {
+  const tr = plan.cursorTrack || [];
+  let best = null;
+  for (const p of tr) { if (p[0] > t + 0.3) break; best = p; }
+  return best ? [best[1], best[2]] : (tr.length ? [tr[0][1], tr[0][2]] : null);
+}
+function addZoom() {
+  snapshot(); ownZooms();
+  const a = range ? range[0] : video.currentTime, b = range ? range[1] : Math.min(D(), video.currentTime + 2.5);
+  if (b - a < MIN) { history.pop(); return; }
+  ed.zooms = ed.zooms.filter((z) => z.end <= a || z.start >= b);
+  const at = cursorAt(a);
+  const z = { start: a, end: b, zoom: 1.8, x: at ? at[0] : 0.5, y: at ? at[1] : 0.5, follow: !!at };
+  ed.zooms.push(z); ed.zooms.sort((p, q) => p.start - q.start);
+  selected = { kind: "zoom", index: ed.zooms.indexOf(z) }; range = null; changed();
+}
+function removeSelected() {
+  if (!selected) return; snapshot();
+  if (selected.kind === "zoom") ownZooms();
+  listFor(selected.kind).splice(selected.index, 1); selected = null; changed();
+}
+function setTrim(side) {
+  snapshot(); const t = video.currentTime;
+  if (side === "in") ed.trim[0] = clamp(t, 0, ed.trim[1] - MIN); else ed.trim[1] = clamp(t, ed.trim[0] + MIN, D());
+  changed();
+}
+
+$("cutSel").onclick = cutRange; $("speedSel").onclick = speedRange; $("zoomSel").onclick = addZoom;
+$("setIn").onclick = () => setTrim("in"); $("setOut").onclick = () => setTrim("out");
+$("resetZooms").onclick = () => { snapshot(); autoZooms = true; ed.zooms = null; selected = null; changed(); };
+$("clearZooms").onclick = () => { snapshot(); autoZooms = false; ed.zooms = []; selected = null; changed(); };
+$("undo").onclick = undo;
+
+// ---------- inspector
+
+function drawInspector() {
+  const body = $("inspectorBody"); body.innerHTML = "";
+  $("inspectorEmpty").hidden = !!(selected || range);
+  if (range && !selected) {
+    body.innerHTML = `<div class="hint">${fmt(range[0])} – ${fmt(range[1])} (${(range[1] - range[0]).toFixed(1)} s)</div>`;
+    return;
+  }
+  if (!selected) return;
+  const item = listFor(selected.kind)[selected.index];
+  if (!item) { selected = null; return; }
+  const rm = `<div class="row"><button class="danger" id="rm">Remove <kbd>Del</kbd></button></div>`;
+  if (selected.kind === "cut") {
+    body.innerHTML = `<div class="hint">Cut ${fmt(item[0])} – ${fmt(item[1])}</div>` + rm;
+  } else if (selected.kind === "speed") {
+    body.innerHTML = `<div class="hint">Speed ${fmt(item.start)} – ${fmt(item.end)}</div>
+      <div class="row"><label>Rate</label><select id="rate">${[1.5, 2, 3, 4, 8, 0.5].map((r) => `<option ${r === item.rate ? "selected" : ""} value="${r}">${r}×</option>`).join("")}</select></div>` + rm;
+    $("rate").onchange = (e) => { snapshot(); item.rate = +e.target.value; changed(); };
+  } else {
+    body.innerHTML = `<div class="hint">Zoom ${fmt(item.start)} – ${fmt(item.end)}${autoZooms ? " (automatic)" : ""}</div>
+      <div class="row"><label>Level</label><input type="range" id="zl" min="1.1" max="4" step="0.1" value="${item.zoom}"><span class="val" id="zlv">${item.zoom.toFixed(1)}×</span></div>
+      <div class="row"><label>Camera</label><label style="flex:1;color:var(--text)"><input type="checkbox" id="zf" ${item.follow ? "checked" : ""}> follow the cursor</label></div>
+      <div class="hint">Click the video to set where it zooms.</div>` + rm;
+    $("zl").oninput = (e) => { $("zlv").textContent = (+e.target.value).toFixed(1) + "×"; };
+    $("zl").onchange = (e) => { snapshot(); ownZooms(); ed.zooms[selected.index].zoom = +e.target.value; changed(); };
+    $("zf").onchange = (e) => { snapshot(); ownZooms(); ed.zooms[selected.index].follow = e.target.checked; changed(); };
+  }
+  $("rm").onclick = removeSelected;
+}
+
+// ---------- preview
+
+function seek(t) { video.currentTime = clamp(t, 0, D()); tick(); }
+
+function layoutFrame() {
+  const vp = $("viewport").getBoundingClientRect(), a = plan.width / plan.height;
+  let w = vp.width, h = w / a; if (h > vp.height) { h = vp.height; w = h * a; }
+  $("frame").style.width = w + "px"; $("frame").style.height = h + "px";
+}
+
+function zoomState(t) {
+  const list = zooms();
+  let best = null, amount = 0;
+  for (const z of list) {
+    if (t < z.start) break;
+    const a = Math.min(ease((t - z.start) / ZOOM_IN), 1 - ease((t - z.end) / ZOOM_OUT));
+    if (a > 0) { best = z; amount = a; }
+  }
+  return [best, amount];
+}
+
+function tick() {
+  const t = video.currentTime;
+  $("time").textContent = fmt(t) + " / " + fmt(D());
+  $("playhead").style.left = `calc(${X(t)})`;
+  const frame = $("frame"), fw = frame.clientWidth, fh = frame.clientHeight, focus = $("focus");
+  const sel = selected && selected.kind === "zoom" ? zooms()[selected.index] : null;
+  if (sel) {
+    const vw = fw / sel.zoom, vh = fh / sel.zoom;
+    const cx = clamp(sel.x * fw, vw / 2, fw - vw / 2), cy = clamp(sel.y * fh, vh / 2, fh - vh / 2);
+    Object.assign(focus.style, { display: "block", left: cx - vw / 2 + "px", top: cy - vh / 2 + "px", width: vw + "px", height: vh + "px" });
+    video.style.transform = "";
+  } else {
+    focus.style.display = "none";
+    const [z, a] = $("previewZoom").checked ? zoomState(t) : [null, 0];
+    if (z) {
+      const s = 1 + (z.zoom - 1) * a;
+      const k = (s - 1) / (z.zoom - 1);
+      const cx = clamp(fw / 2 + (z.x * fw - fw / 2) * k, fw / s / 2, fw - fw / s / 2);
+      const cy = clamp(fh / 2 + (z.y * fh - fh / 2) * k, fh / s / 2, fh - fh / s / 2);
+      video.style.transform = `translate(${fw / 2 - cx * s}px, ${fh / 2 - cy * s}px) scale(${s})`;
+    } else video.style.transform = "";
+  }
+}
+
+function playLoop() {
+  if (video.paused) return;
+  const t = video.currentTime;
+  if (t < ed.trim[0] - 0.05) video.currentTime = ed.trim[0];
+  else if (t >= ed.trim[1]) { video.pause(); video.currentTime = ed.trim[1]; }
+  else { const c = ed.cuts.find((c) => t >= c[0] && t < c[1]); if (c) video.currentTime = c[1]; }
+  const r = rateAt(video.currentTime); if (video.playbackRate !== r) video.playbackRate = r;
+  tick(); requestAnimationFrame(playLoop);
+}
+function togglePlay() {
+  if (video.paused) { if (video.currentTime >= ed.trim[1] - 0.05) video.currentTime = ed.trim[0]; video.play(); } else video.pause();
+}
+video.addEventListener("play", () => { $("play").textContent = "Pause"; requestAnimationFrame(playLoop); });
+video.addEventListener("pause", () => { $("play").textContent = "Play"; tick(); });
+video.addEventListener("seeked", tick);
+$("play").onclick = togglePlay;
+$("previewZoom").onchange = tick;
+
+$("frame").addEventListener("click", (ev) => {
+  if (!selected || selected.kind !== "zoom") return;
+  const r = $("frame").getBoundingClientRect();
+  snapshot(); ownZooms();
+  const z = ed.zooms[selected.index];
+  z.x = clamp((ev.clientX - r.left) / r.width, 0, 1); z.y = clamp((ev.clientY - r.top) / r.height, 0, 1);
+  changed(); tick();
+});
+
+// ---------- settings
+
+function bindAudio() {
+  const hasMic = plan.audioTracks.includes("mic");
+  $("micRow").hidden = !hasMic;
+  $("sysLabel").textContent = hasMic ? "Desktop" : "Volume";
+  $("audioHint").textContent = !plan.audio ? "This recording has no audio." :
+    hasMic ? "Desktop and microphone were recorded on separate tracks." : "Record with Studio on and desktop+mic to get a separate mic level.";
+  for (const k of ["system", "mic"]) {
+    $(k).value = ed.audio[k]; $(k + "Val").textContent = Math.round(ed.audio[k] * 100) + "%";
+    $(k).oninput = (e) => { $(k + "Val").textContent = Math.round(e.target.value * 100) + "%"; };
+    $(k).onchange = (e) => { snapshot(); ed.audio[k] = +e.target.value; changed(); };
+  }
+  $("denoise").checked = ed.audio.denoise;
+  $("denoise").onchange = (e) => { snapshot(); ed.audio.denoise = e.target.checked; changed(); };
+  for (const id of ["system", "mic", "denoise"]) $(id).disabled = !plan.audio;
+}
+
+function bindWebcam() {
+  $("webcamBox").hidden = !plan.webcam;
+  const c = ed.webcam;
+  $("camOn").checked = c.enabled; $("camMirror").checked = c.mirror; $("camCorner").value = c.corner;
+  $("camSize").value = c.size; $("camSizeVal").textContent = Math.round(c.size * 100) + "%";
+  $("camOn").onchange = (e) => { snapshot(); c.enabled = e.target.checked; changed(); };
+  $("camMirror").onchange = (e) => { snapshot(); c.mirror = e.target.checked; changed(); };
+  $("camCorner").onchange = (e) => { snapshot(); c.corner = e.target.value; changed(); };
+  $("camSize").oninput = (e) => { $("camSizeVal").textContent = Math.round(e.target.value * 100) + "%"; };
+  $("camSize").onchange = (e) => { snapshot(); c.size = +e.target.value; changed(); };
+}
+
+function bindLook() {
+  $("background").innerHTML = BACKGROUNDS.map((b) => `<option value="${b}">${b}</option>`).join("");
+  const r = ed.render || {};
+  if (BACKGROUNDS.includes(r.background)) $("background").value = r.background;
+  if (r.format) $("format").value = r.format;
+  if (r.export) $("export").value = r.export;
+  for (const id of ["background", "format", "export"]) $(id).onchange = () => changed();
+}
+
+// ---------- render
+
+async function render(quality) {
+  clearTimeout(saveTimer); await save();
+  try {
+    await api("render", { quality, background: $("background").value, format: $("format").value, export: $("export").value });
+  } catch (e) { showError("renderStatus", e.message); return; }
+  $("renderStatus").textContent = quality === "preview" ? "Rendering a quick preview…" : "Rendering…";
+  $("result").innerHTML = ""; $("cancel").hidden = false;
+  $("renderPreview").disabled = $("renderFinal").disabled = true;
+  clearInterval(polling); polling = setInterval(poll, 500);
+}
+
+async function poll() {
+  const s = await api("progress").catch(() => null); if (!s) return;
+  $("progress").style.width = Math.round(s.progress * 100) + "%";
+  if (s.running) return;
+  clearInterval(polling); $("cancel").hidden = true;
+  $("renderPreview").disabled = $("renderFinal").disabled = false;
+  const r = s.result;
+  if (!r || !r.ok) { $("progress").style.width = "0"; showError("renderStatus", ((r && r.message) || "Render failed")); return; }
+  $("progress").style.width = "100%";
+  $("renderStatus").textContent = "Saved " + r.file + " · " + fmt(r.duration) + " · " + r.size.join("×") + " · " + r.encoder;
+  const src = base + "output?" + Date.now();
+  $("result").innerHTML = r.file.endsWith(".gif") ? `<img src="${src}">` : `<video src="${src}" controls></video>`;
+}
+
+$("renderPreview").onclick = () => render("preview");
+$("renderFinal").onclick = () => render("final");
+$("cancel").onclick = () => api("cancel", {});
+$("close").onclick = async () => { clearTimeout(saveTimer); await save(); await api("quit", {}).catch(() => {}); document.body.innerHTML = '<p style="padding:24px">Editor closed. Your edits are saved; you can close this tab.</p>'; };
+
+document.addEventListener("keydown", (ev) => {
+  if (ev.target.tagName === "INPUT" || ev.target.tagName === "SELECT") return;
+  const k = ev.key.toLowerCase();
+  if ((ev.ctrlKey || ev.metaKey) && k === "z") { ev.preventDefault(); undo(); return; }
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  if (k === " ") { ev.preventDefault(); togglePlay(); }
+  else if (k === "i") setTrim("in");
+  else if (k === "o") setTrim("out");
+  else if (k === "x") cutRange();
+  else if (k === "s") speedRange();
+  else if (k === "z") addZoom();
+  else if (k === "delete" || k === "backspace") removeSelected();
+  else if (k === "escape") { selected = null; range = null; drawTimeline(); drawInspector(); tick(); }
+  else if (k === "arrowleft") seek(video.currentTime - (ev.shiftKey ? 1 : 1 / 30));
+  else if (k === "arrowright") seek(video.currentTime + (ev.shiftKey ? 1 : 1 / 30));
+});
+window.addEventListener("resize", () => { layoutFrame(); drawRuler(); tick(); });
+
+(async function init() {
+  try { plan = await api("state"); } catch (e) { showError("status", e.message); return; }
+  const th = plan.theme || {};
+  const css = document.documentElement.style;
+  if (th.accent) { css.setProperty("--accent", th.accent); css.setProperty("--zoom", th.accent); }
+  if (th.background) css.setProperty("--bg", th.background);
+  if (th.foreground) css.setProperty("--text", th.foreground);
+  ed = plan.edits; autoZooms = ed.zooms === null;
+  $("name").textContent = plan.name;
+  $("film").style.backgroundImage = `url(${base}thumbs.jpg)`;
+  video.src = base + "video";
+  bindLook(); bindAudio(); bindWebcam();
+  layoutFrame(); drawRuler(); drawTimeline(); drawInspector(); updateDurations(); tick();
+  $("status").textContent = plan.events ? "Saved" : "Saved · no cursor log, so no automatic zooms";
+})();
+</script>
+</body>
+</html>

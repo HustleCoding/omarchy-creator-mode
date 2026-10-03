@@ -34,12 +34,15 @@ Item {
   property bool studioAvailable: true
   property bool studioEnabled: true
   readonly property bool studioOn: studioAvailable && studioEnabled
-  readonly property var backgrounds: ["theme", "wallpaper", "midnight", "sunset", "ocean", "aurora", "candy", "peach", "forest", "slate", "mono"]
+  readonly property var backgrounds: ["theme", "wallpaper", "midnight", "sunset", "ocean", "aurora", "candy", "peach", "dusk", "lime", "forest", "slate", "mono"]
   property int backgroundIndex: 0
   readonly property string background: backgrounds[backgroundIndex]
-  readonly property var formats: ["source", "16:9", "9:16", "1:1"]
+  readonly property var formats: ["source", "16:9", "9:16", "1:1", "4:5"]
   property int formatIndex: 0
   readonly property string format: formats[formatIndex]
+  property bool webcamAvailable: false
+  property bool webcamEnabled: false
+  readonly property bool webcamOn: studioOn && webcamAvailable && webcamEnabled
   property bool recordingTracked: false
   property real renderProgress: 0
   property string studioFile: ""
@@ -60,7 +63,8 @@ Item {
   property bool foreignRecording: false
 
   readonly property bool cardVisible: opened && ["idle", "countdown", "rendering", "saved", "error"].indexOf(phase) !== -1
-  readonly property bool pillVisible: ["starting", "recording", "saving"].indexOf(phase) !== -1
+  // Layer surfaces are part of the capture, so nothing is shown while recording.
+  readonly property bool pillVisible: phase === "saving"
 
   // Theme
   readonly property string fontFamily: Style.font.menuFamily
@@ -189,6 +193,17 @@ Item {
     root.backgroundIndex = (root.backgroundIndex + 1) % root.backgrounds.length
   }
 
+  function toggleWebcam() {
+    if (!root.webcamAvailable) { root.notice = "No webcam found"; return }
+    root.webcamEnabled = !root.webcamEnabled
+  }
+
+  function openEditor() {
+    if (!root.recordingFile) return
+    root.notice = "Opening the timeline editor…"
+    run("edit", ["edit", root.recordingFile])
+  }
+
   function cycleFormat() {
     root.formatIndex = (root.formatIndex + 1) % root.formats.length
   }
@@ -289,6 +304,7 @@ Item {
       if (!result.ok) { root.fail("Can't record yet", result.message); return }
       root.outputDir = result.outputDir || ""
       root.studioAvailable = result.studio !== false
+      root.webcamAvailable = result.webcam === true
       run("status", ["status"])
       return
     }
@@ -368,6 +384,12 @@ Item {
       return
     }
 
+    if (action === "edit") {
+      if (!result.ok) root.notice = result.message
+      else root.dismiss()
+      return
+    }
+
     if (action === "reveal") {
       if (!result.ok) root.notice = result.message
       else root.dismiss()
@@ -430,7 +452,7 @@ Item {
     id: startDelay
     interval: 250
     onTriggered: root.run("start", ["start", "--audio=" + root.audioMode, "--target=" + root.captureTarget,
-                                     "--studio=" + (root.studioOn ? "on" : "off")])
+                                     "--studio=" + (root.studioOn ? "on" : "off"), "--webcam=" + (root.webcamOn ? "on" : "off")])
   }
 
   Timer {
@@ -559,6 +581,7 @@ Item {
           else if (k === Qt.Key_S) root.toggleStudio()
           else if (k === Qt.Key_B && root.studioOn) root.cycleBackground()
           else if (k === Qt.Key_F && root.studioOn) root.cycleFormat()
+          else if (k === Qt.Key_W && root.studioOn) root.toggleWebcam()
           else if (k === Qt.Key_Escape || k === Qt.Key_Q) root.dismiss()
           else handled = false
         } else if (s === "rendering") {
@@ -566,6 +589,7 @@ Item {
           else handled = false
         } else if (s === "saved") {
           if (k === Qt.Key_O) root.revealFolder()
+          else if (k === Qt.Key_E && root.studioAvailable) root.openEditor()
           else if (k === Qt.Key_Return || k === Qt.Key_Enter || k === Qt.Key_R) { root.phase = "idle"; root.refreshReadiness() }
           else if (k === Qt.Key_Escape || k === Qt.Key_Q) root.dismiss()
           else handled = false
@@ -642,7 +666,7 @@ Item {
             width: parent.width
             wrapMode: Text.Wrap
             text: root.studioOn
-              ? "Studio on · auto-zoom, smooth cursor, " + root.background + " background, " + (root.format === "source" ? "source size" : root.format)
+              ? "Studio on · auto-zoom, smooth cursor, " + root.background + " background, " + (root.format === "source" ? "source size" : root.format) + (root.webcamOn ? ", webcam" : "")
               : (root.studioAvailable ? "Studio off · raw recording only" : "Studio unavailable (needs python3 + ffmpeg)")
             color: root.studioOn ? root.accent : root.muted
             font.family: root.fontFamily
@@ -676,6 +700,7 @@ Item {
           KeyAction { keyLabel: "S"; label: "Studio"; onActivated: root.toggleStudio() }
           KeyAction { keyLabel: "B"; label: "Background"; visible: root.studioOn; onActivated: root.cycleBackground() }
           KeyAction { keyLabel: "F"; label: "Format"; visible: root.studioOn; onActivated: root.cycleFormat() }
+          KeyAction { keyLabel: "W"; label: root.webcamOn ? "Webcam on" : "Webcam"; visible: root.studioOn && root.webcamAvailable; onActivated: root.toggleWebcam() }
           KeyAction { keyLabel: "Esc"; label: "Close"; onActivated: root.dismiss() }
         }
 
@@ -837,6 +862,7 @@ Item {
           width: parent.width
           spacing: Style.space(10)
           KeyAction { keyLabel: "O"; label: "Open folder"; primary: true; onActivated: root.revealFolder() }
+          KeyAction { keyLabel: "E"; label: "Edit timeline"; visible: root.studioAvailable; onActivated: root.openEditor() }
           KeyAction { keyLabel: "Enter"; label: "New recording"; onActivated: { root.phase = "idle"; root.refreshReadiness() } }
           KeyAction { keyLabel: "Esc"; label: "Done"; onActivated: root.dismiss() }
         }

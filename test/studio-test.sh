@@ -87,6 +87,101 @@ check "forced vaapi without a device fails clearly" test "$(field .error)" = vaa
 CREATOR_MODE_VAAPI_DEVICE=/nonexistent render --encoder auto --out "$TMP/auto.mp4"
 check "auto encoder falls back to x264" test "$(field .encoder)" = x264
 
+offsets() {
+  python3 - "$STUDIO" <<'PY'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("studio", sys.argv[1])
+st = importlib.util.module_from_spec(importlib.util.spec_from_loader("studio", loader))
+loader.exec_module(st)
+meta = {"start": 100.0}
+assert abs(st.capture_offset(meta, {"recStart": 101.5}, 12.0, 9.0) - 1.5) < 1e-9
+assert st.capture_offset(meta, {}, 12.0, 9.0) == 3.0
+assert st.capture_offset(meta, {"recStart": "x"}, 12.0, 9.0) == 3.0
+assert abs(st.webcam_lead({"recStart": 101.5, "webcamStart": 101.25}, 20.0, 9.0) - 0.25) < 1e-9
+assert st.webcam_lead({}, 10.0, 9.0) == 1.0
+PY
+}
+check "cursor and webcam line up on the recorder's start mark, not the end mark" offsets
+
+motion() {
+  python3 - "$STUDIO" <<'PY'
+import importlib.machinery, importlib.util, math, sys
+loader = importlib.machinery.SourceFileLoader("studio", sys.argv[1])
+st = importlib.util.module_from_spec(importlib.util.spec_from_loader("studio", loader))
+loader.exec_module(st)
+ident = lambda x, y: (x, y)
+# rest at 0, a 0.5 s move to 600 logged at 60 Hz, then rest
+moves = [(0.0, 0.0, 0.0)] + [(1.0 + i / 60, 600 * i / 30, 0.0) for i in range(31)]
+out = st.smooth_cursor(moves, 150, 60, 0.0, ident, 0.55, 1.5)
+xs = [p[0] for p in out]
+mid = xs[int(1.25 * 60)]
+assert abs(mid - 300) < 25, mid                      # no lag behind the real move
+assert max(xs) < 601 and min(xs) > -1, (min(xs), max(xs))  # no overshoot
+assert abs(xs[60 + 45] - 600) < 1 and abs(xs[30]) < 1  # settles on the rests
+acc = [abs(xs[i + 1] - 2 * xs[i] + xs[i - 1]) for i in range(1, 149)]
+assert max(acc) < 6, max(acc)                        # eases in/out instead of snapping
+assert st.smooth_cursor(moves, 10, 60, -1.0, ident, 0.55, 1.5)[0] is None
+cam = st.camera_keyframed([(0, 0, 100, 50), (0, 0, 100, 50), (20, 10, 50, 25)], 2)
+assert cam[1] == (10.0, 5.0, 75.0, 37.5)
+assert st.to_output([(0, 0, 45.0, 22.5), None], [(20, 10, 50, 25)] * 2, 1000, 500) == [(0, 0, 500.0, 250.0), None]
+PY
+}
+check "cursor glides without lag or overshoot and is placed in the zoomed output" motion
+
+framing() {
+  python3 - "$STUDIO" <<'PY'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("studio", sys.argv[1])
+st = importlib.util.module_from_spec(importlib.util.spec_from_loader("studio", loader))
+loader.exec_module(st)
+# 400x100 frame: dark background, text lines from x=40 to x=360
+gw, gh = 400, 100
+gray = bytearray(gw * gh)
+for y in range(20, 80, 6):
+    for x in range(40, 360):
+        if x % 7:
+            gray[y * gw + x] = gray[(y + 1) * gw + x] = 220
+# a table gap at x=60..80 isn't taken for the start of the lines
+for y in range(20, 80):
+    for x in range(60, 80):
+        gray[y * gw + x] = 0
+# a 2x zoom on x=200 would start the view at x=100, mid-line: it moves left to the line starts
+cx = st.frame_center_x(bytes(gray), gw, gh, 200, 50, 100, 25, 400, 100)
+assert 130 < cx < 141, cx
+# the focus point stays in view
+assert cx - 100 <= 200 - 0.15 * 200
+# nothing under the left edge: unchanged
+assert st.frame_center_x(bytes(gh * gw), gw, gh, 200, 50, 100, 25, 400, 100) == 200
+PY
+}
+check "zooms don't cut off the start of lines of text" framing
+
+cursor_shape() {
+  python3 - "$STUDIO" <<'PY'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("studio", sys.argv[1])
+st = importlib.util.module_from_spec(importlib.util.spec_from_loader("studio", loader))
+loader.exec_module(st)
+ident = lambda x, y: (x, y)
+wins = [(0.0, [[0, 0, 100, 100, "Alacritty"], [0, 0, 400, 400, "chromium"]]),
+        (1.0, [[0, 0, 400, 400, "chromium"]])]
+shapes = st.cursor_shapes([(50, 50), (200, 50), None, (50, 50)], wins, 2, 0.0, ident)
+assert shapes == ["ibeam", "arrow", "arrow", "arrow"], shapes
+assert st.cursor_shapes([(50, 50)], [], 2, 0.0, ident) == ["arrow"]
+levels = st.cursor_levels(1.5)
+assert 1.0 in levels and min(levels) <= st.PRESS_SCALE and max(levels) >= 1.5
+rows = {(s, i): (k, 0.0, 0.0) for k, (s, i) in enumerate((s, i) for s in ("arrow", "ibeam") for i in range(len(levels)))}
+rows[("ibeam", levels.index(1.0))] = (99, 4.0, 10.0)
+out = st.pick_tiles([(3, 1.0, 100.0, 100.0), (3, 1.0, 100.0, 100.0), None], [1.0, 2.0, 1.0],
+                    ["ibeam", "arrow", "arrow"], levels, rows)
+assert out[0] == (3, 99, 96.0, 90.0), out[0]          # I-beam drawn around its stem
+grown = levels[next(i for (_, i), v in rows.items() if v[0] == out[1][1])]
+assert abs(grown - 2.0 ** st.ZOOM_CURSOR) < 0.05, grown  # the cursor grows with the zoom
+assert out[2] is None
+PY
+}
+check "I-beam over terminals, and the cursor grows with the zoom" cursor_shape
+
 echo
 echo "$pass passed, $failed failed"
 [ "$failed" -eq 0 ]
