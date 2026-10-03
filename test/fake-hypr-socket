@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+# TEST ONLY. Serves Hyprland's `j/cursorpos` IPC request on a Unix socket,
+# moving the cursor along a slow diagonal so the tracker has something to log.
+import json
+import os
+import socket
+import sys
+import time
+
+path = sys.argv[1]
+if os.path.exists(path):
+    os.unlink(path)
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(path)
+srv.listen(8)
+t0 = time.time()
+while True:
+    conn, _ = srv.accept()
+    with conn:
+        if conn.recv(64) == b"j/cursorpos":
+            t = time.time() - t0
+            conn.sendall(json.dumps({"x": int(40 + 60 * t), "y": int(30 + 40 * t)}).encode())

@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+"""creator-mode-studio: turn a Creator Mode recording into a polished "studio" cut.
+
+    creator-mode-studio render VIDEO [options]
+
+What it does (all local, ffmpeg + Python standard library only):
+  * auto-zoom: eases in on clicks (or on where the cursor comes to rest when
+    clicks weren't readable), follows the cursor while zoomed, eases back out
+  * smooth cursor: redraws the cursor from the logged path with spring
+    smoothing (the recording itself is captured without a cursor)
+  * click rings, a padded background, rounded corners and a soft shadow
+
+Cursor/click data comes from the events file written by creator-mode-track
+(default: <video dir>/.creator-mode/<video name>.events.jsonl). Without it the
+video is only framed (no zoom, no redrawn cursor).
+
+With --json-progress every stdout line is a JSON object:
+  {"progress":0.42}  ...  {"ok":true,"file":"...","duration":12.3}
+Failures print {"ok":false,"error":...,"message":...} and exit non-zero.
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import zlib
+
+PRESETS = {
+    "midnight": ("#312e81", "#0b1020"),
+    "sunset": ("#fb923c", "#be185d"),
+    "ocean": ("#38bdf8", "#4338ca"),
+    "forest": ("#34d399", "#064e3b"),
+    "mono": ("#3f3f46", "#09090b"),
+}
+THEME_COLORS = os.path.expanduser("~/.local/state/omarchy/current/theme/colors.toml")
+
+# Timing of the automatic zoom, in seconds.
+ZOOM_LEAD = 0.35       # start easing in this long before a click
+ZOOM_HOLD = 1.8        # stay zoomed this long after the last click
+KEY_HOLD = 1.2         # typing keeps an existing zoom alive this long
+MERGE_GAP = 1.2        # clicks closer than hold + this share one zoom
+DWELL_MOVE = 80        # logical px the cursor must travel before a rest counts
+DWELL_STILL = 6        # logical px of jitter allowed while resting
+DWELL_TIME = 0.45      # rest this long to count as a focus point
+DEADZONE = 0.30        # while zoomed, re-center once the cursor leaves this inner fraction
+CLICK_RING_TIME = 0.22
+
+JSON_MODE = False
+
+
+class RenderError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def emit(obj):
+    if JSON_MODE:
+        print(json.dumps(obj), flush=True)
+
+
+def log(msg):
+    if not JSON_MODE:
+        print(msg, file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------------ probing
+
+def probe(video):
+    try:
+        raw = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,width,height,r_frame_rate:format=duration", "-of", "json", video],
+            check=True, capture_output=True, text=True).stdout
+        info = json.loads(raw)
+    except (OSError, subprocess.CalledProcessError, ValueError) as e:
+        raise RenderError("probe_failed", f"Can't read {video} with ffprobe: {e}") from e
+    streams = info.get("streams", [])
+    vs = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if not vs:
+        raise RenderError("probe_failed", f"No video stream in {video}")
+    num, _, den = vs.get("r_frame_rate", "60/1").partition("/")
+    fps = float(num) / float(den or 1) if float(den or 1) else 60.0
+    if not 1 <= fps <= 240:
+        fps = 60.0
+    duration = float(info.get("format", {}).get("duration") or 0)
+    if duration <= 0:
+        raise RenderError("probe_failed", f"{video} has no duration")
+    return {
+        "w": int(vs["width"]), "h": int(vs["height"]), "fps": fps, "duration": duration,
+        "audio": any(s.get("codec_type") == "audio" for s in streams),
+    }
+
+
+def ffmpeg_script_flag():
+    try:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-version"], capture_output=True, text=True).stdout
+    except OSError:
+        raise RenderError("missing_dependency", "Missing: ffmpeg. Install with: sudo pacman -S ffmpeg") from None
+    m = re.search(r"ffmpeg version n?(\d+)\.(\d+)", out)
+    if m and (int(m.group(1)), int(m.group(2))) < (7, 1):
+        return "-filter_complex_script"
+    return "-/filter_complex"
+
+
+# ------------------------------------------------------------------ events
+
+def default_events_path(video):
+    d, name = os.path.split(os.path.abspath(video))
+    return os.path.join(d, ".creator-mode", os.path.splitext(name)[0] + ".events.jsonl")
+
+
+def load_events(path):
+    meta, moves, clicks, keys, end = None, [], [], [], None
+    with open(path) as f:
+        for line in f:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            kind = ev.get("type")
+            if kind == "meta":
+                meta = ev
+            elif kind == "click":
+                clicks.append(float(ev["t"]))
+            elif kind == "key":
+                keys.append(float(ev["t"]))
+            elif kind == "end":
+                end = float(ev["t"])
+            elif "x" in ev and "y" in ev:
+                moves.append((float(ev["t"]), float(ev["x"]), float(ev["y"])))
+    if not meta or "region" not in meta:
+        raise RenderError("bad_events", f"{path} has no header line")
+    return meta, moves, clicks, keys, end
+
+
+# ------------------------------------------------------------------ motion
+
+class Spring:
+    """Semi-implicit damped spring; ratio 1.0 is critically damped."""
+
+    def __init__(self, value, stiffness, ratio=1.0):
+        self.value = value
+        self.velocity = 0.0
+        self.k = stiffness
+        self.c = 2.0 * math.sqrt(stiffness) * ratio
+
+    def step(self, target, dt):
+        accel = self.k * (target - self.value) - self.c * self.velocity
+        self.velocity += accel * dt
+        self.value += self.velocity * dt
+        return self.value
+
+
+def sample_cursor(moves, n_frames, fps, offset, map_xy):
+    """Cursor position (video px, or None before the first sample) at each frame."""
+    out = [None] * n_frames
+    i, current = 0, None
+    for n in range(n_frames):
+        t = n / fps + offset
+        while i < len(moves) and moves[i][0] <= t:
+            current = map_xy(moves[i][1], moves[i][2])
+            i += 1
+        out[n] = current
+    return out
+
+
+def dwell_points(cursor, fps, scale):
+    """Frames where the cursor comes to rest after travelling (click stand-in)."""
+    points, anchor, still_since, travelled, last_point = [], None, None, 0.0, -1e9
+    move_px, still_px, still_frames = DWELL_MOVE * scale, DWELL_STILL * scale, int(DWELL_TIME * fps)
+    prev = None
+    for n, pos in enumerate(cursor):
+        if pos is None:
+            continue
+        if prev is not None:
+            travelled += math.hypot(pos[0] - prev[0], pos[1] - prev[1])
+        prev = pos
+        if anchor is None or math.hypot(pos[0] - anchor[0], pos[1] - anchor[1]) > still_px:
+            anchor, still_since = pos, n
+            continue
+        if n - still_since == still_frames and travelled >= move_px and (n - last_point) / fps > 1.5:
+            points.append(still_since / fps)
+            last_point = n
+            travelled = 0.0
+    return points
+
+
+def zoom_segments(focus_times, key_times, duration):
+    segs = []
+    for t in sorted(focus_times):
+        start, hold = max(0.0, t - ZOOM_LEAD), t + ZOOM_HOLD
+        if segs and start <= segs[-1][1] + MERGE_GAP:
+            segs[-1][1] = max(segs[-1][1], hold)
+            segs[-1][2].append(t)
+        else:
+            segs.append([start, hold, [t]])
+    for k in key_times:
+        for seg in segs:
+            if seg[0] <= k <= seg[1]:
+                seg[1] = max(seg[1], k + KEY_HOLD)
+    return [(s, min(h, duration), ts) for s, h, ts in segs]
+
+
+def camera_path(cursor, n_frames, fps, w, h, segments, zoom):
+    """Per-frame (zoom, center_x, center_y)."""
+    dt = 1.0 / fps
+    z_spring = Spring(1.0, 34.0)
+    cx_spring, cy_spring = Spring(w / 2, 22.0), Spring(h / 2, 22.0)
+    seg_i, target = 0, (w / 2, h / 2)
+    out = []
+    for n in range(n_frames):
+        t = n * dt
+        while seg_i < len(segments) and t > segments[seg_i][1]:
+            seg_i += 1
+        active = seg_i < len(segments) and segments[seg_i][0] <= t <= segments[seg_i][1]
+        pos = cursor[n]
+        if active:
+            seg = segments[seg_i]
+            if abs(t - seg[0]) < dt:
+                first = int(min(seg[2][0], (n_frames - 1) / fps) * fps)
+                target = cursor[first] or pos or target
+            elif pos is not None:
+                hw, hh = w / (2 * zoom), h / (2 * zoom)
+                if abs(pos[0] - target[0]) > hw * (1 - DEADZONE) or abs(pos[1] - target[1]) > hh * (1 - DEADZONE):
+                    target = pos
+            z_target = zoom
+        else:
+            target = (w / 2, h / 2)
+            z_target = 1.0
+        z = max(1.0, z_spring.step(z_target, dt))
+        cx, cy = cx_spring.step(target[0], dt), cy_spring.step(target[1], dt)
+        hw, hh = w / (2 * z), h / (2 * z)
+        cx = min(max(cx, hw), w - hw)
+        cy = min(max(cy, hh), h - hh)
+        out.append((z, cx, cy))
+    return out
+
+
+def piecewise_expr(values, step):
+    """ffmpeg expression over `in` (frame index) that linearly interpolates
+    `values` sampled every `step` frames; zeros collapse into one branch. The
+    expression is a balanced if-tree so evaluation stays O(log n) per frame."""
+    n = len(values)
+    leaves = []  # (start, end, text)
+    for a in range(0, n, step):
+        b = min(a + step, n - 1)
+        va, vb = values[a], values[b]
+        if abs(va) < 0.01 and abs(vb) < 0.01:
+            text = "0"
+        elif b == a or abs(vb - va) < 0.01:
+            text = f"{va:.2f}"
+        else:
+            text = f"({va:.2f}+{(vb - va) / (b - a):.4f}*(in-{a}))"
+        if leaves and leaves[-1][2] == text == "0":
+            leaves[-1] = (leaves[-1][0], a + step, "0")
+        else:
+            leaves.append((a, a + step, text))
+
+    def build(lo, hi):
+        if hi - lo == 1:
+            return leaves[lo][2]
+        mid = (lo + hi) // 2
+        return f"if(lt(in,{leaves[mid][0]}),{build(lo, mid)},{build(mid, hi)})"
+
+    return build(0, len(leaves)) if leaves else "0"
+
+
+# ------------------------------------------------------------------ images
+
+def write_png(path, width, height, rgba):
+    raw = b"".join(b"\x00" + bytes(rgba[y * width * 4:(y + 1) * width * 4]) for y in range(height))
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)))
+        f.write(chunk(b"IDAT", zlib.compress(raw, 6)))
+        f.write(chunk(b"IEND", b""))
+
+
+def inside(poly, x, y):
+    hit = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            hit = not hit
+        j = i
+    return hit
+
+
+# Arrow cursor in a 17x25 design grid; the hotspot is the tip at (0, 0).
+ARROW_OUTER = [(0, 0), (0, 22.4), (5.4, 17.1), (9.0, 25.2), (12.9, 23.5), (9.4, 15.6), (16.6, 15.6)]
+ARROW_INNER = [(1.6, 3.8), (1.6, 18.6), (5.9, 14.4), (9.8, 23.0), (11.0, 22.5), (7.1, 13.9), (12.9, 13.9)]
+
+
+def make_cursor(path, size_px):
+    """Black arrow, white outline, soft drop shadow. Returns (w, h, hotspot_x, hotspot_y)."""
+    unit = size_px / 25.2
+    pad = max(2, int(round(3 * unit)))
+    w = int(math.ceil(17 * unit)) + pad * 2
+    h = int(math.ceil(25.5 * unit)) + pad * 2
+    ss = 3
+    cover_outer = [0.0] * (w * h)
+    cover_inner = [0.0] * (w * h)
+    outer = [(x * unit + pad, y * unit + pad) for x, y in ARROW_OUTER]
+    inner = [(x * unit + pad, y * unit + pad) for x, y in ARROW_INNER]
+    for py in range(h):
+        for px in range(w):
+            o = i = 0
+            for sy in range(ss):
+                for sx in range(ss):
+                    x, y = px + (sx + 0.5) / ss, py + (sy + 0.5) / ss
+                    if inside(outer, x, y):
+                        o += 1
+                        if inside(inner, x, y):
+                            i += 1
+            cover_outer[py * w + px] = o / (ss * ss)
+            cover_inner[py * w + px] = i / (ss * ss)
+    # shadow: outer coverage shifted down/right and box-blurred
+    shift = max(1, int(round(1.2 * unit)))
+    radius = max(1, int(round(1.5 * unit)))
+    shadow = [0.0] * (w * h)
+    for py in range(h):
+        for px in range(w):
+            acc = cnt = 0
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    x, y = px - shift + dx, py - shift + dy
+                    if 0 <= x < w and 0 <= y < h:
+                        acc += cover_outer[y * w + x]
+                    cnt += 1
+            shadow[py * w + px] = acc / cnt * 0.45
+    rgba = bytearray(w * h * 4)
+    for k in range(w * h):
+        o, i, s = cover_outer[k], cover_inner[k], shadow[k]
+        # white outline over shadow, black body over outline
+        a = o + s * (1 - o)
+        white = o - i
+        c = (255 * white) / a if a > 0 else 0
+        rgba[k * 4:k * 4 + 4] = bytes((int(c), int(c), int(c), int(round(a * 255))))
+    write_png(path, w, h, rgba)
+    return w, h, pad, pad
+
+
+def make_ring(path, radius_px, width_px):
+    size = int(math.ceil((radius_px + width_px) * 2)) + 4
+    c = size / 2
+    rgba = bytearray(size * size * 4)
+    for y in range(size):
+        for x in range(size):
+            d = abs(math.hypot(x + 0.5 - c, y + 0.5 - c) - radius_px)
+            a = min(1.0, max(0.0, width_px / 2 + 0.5 - d))
+            k = (y * size + x) * 4
+            rgba[k:k + 4] = bytes((255, 255, 255, int(a * 170)))
+    write_png(path, size, size, rgba)
+    return size
+
+
+def theme_gradient():
+    try:
+        with open(THEME_COLORS) as f:
+            text = f.read()
+    except OSError:
+        return None
+    colors = dict(re.findall(r'^\s*(\w+)\s*=\s*"(#[0-9a-fA-F]{6})"', text, re.M))
+    if "accent" not in colors:
+        return None
+    return colors["accent"], colors.get("darker_background") or colors.get("background") or "#101019"
+
+
+def parse_hex(c):
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def background_colors(spec):
+    if spec == "theme":
+        return theme_gradient() or PRESETS["midnight"]
+    if spec in PRESETS:
+        return PRESETS[spec]
+    m = re.fullmatch(r"(#[0-9a-fA-F]{6})(?::(#[0-9a-fA-F]{6}))?", spec)
+    if m:
+        return m.group(1), m.group(2) or m.group(1)
+    return None
+
+
+def rounded_sdf(cx, cy, hw, hh, r):
+    """ffmpeg expression: signed distance from pixel (X,Y) to a rounded rect."""
+    qx = f"(abs(X+0.5-{cx:.2f})-{hw - r:.2f})"
+    qy = f"(abs(Y+0.5-{cy:.2f})-{hh - r:.2f})"
+    return f"(hypot(max({qx},0),max({qy},0))+min(max({qx},{qy}),0)-{r:.2f})"
+
+
+def run_ffmpeg(args, what):
+    proc = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"] + args,
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RenderError("ffmpeg_failed", f"ffmpeg failed while {what}: {proc.stderr.strip()[-400:]}")
+
+
+def make_backdrop(path, cw, ch, box, radius, spec):
+    """Background (gradient or image) with the shadow of the video card baked in."""
+    x, y, bw, bh = box
+    hw_small = 2  # render at half size; both layers are smooth
+    sw, sh = max(2, cw // hw_small), max(2, ch // hw_small)
+    k = sw / cw
+    colors = background_colors(spec)
+    if colors:
+        (r1, g1, b1), (r2, g2, b2) = parse_hex(colors[0]), parse_hex(colors[1])
+        t = "((X/W)*0.45+(Y/H)*0.55)"
+        bg = (f"geq=r='{r1}+({r2 - r1})*{t}':g='{g1}+({g2 - g1})*{t}':b='{b1}+({b2 - b1})*{t}'")
+        bg_input = ["-f", "lavfi", "-i", f"color=black:s={sw}x{sh}:d=1,format=rgb24"]
+    elif os.path.isfile(spec):
+        bg = f"scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh},format=rgb24"
+        bg_input = ["-i", spec]
+    else:
+        raise RenderError("usage", f"Unknown background: {spec} (use theme, {', '.join(PRESETS)}, #rrggbb[:#rrggbb] or an image path)")
+    sigma = 0.03 * ch * k
+    sdf = rounded_sdf((x + bw / 2) * k, (y + bh / 2 + 0.014 * ch) * k, bw / 2 * k, bh / 2 * k, radius * k)
+    shadow = f"geq=r=0:g=0:b=0:a='255*0.38*exp(-pow(max({sdf},0)/{sigma:.2f},2))'"
+    run_ffmpeg(bg_input + ["-f", "lavfi", "-i", f"color=black:s={sw}x{sh}:d=1,format=rgba",
+                           "-filter_complex", f"[0:v]{bg}[b];[1:v]{shadow}[s];[b][s]overlay=format=rgb,scale={cw}:{ch}:flags=bicubic,format=rgb24",
+                           "-frames:v", "1", path], "drawing the background")
+
+
+def make_mask(path, w, h, radius):
+    sdf = rounded_sdf(w / 2, h / 2, w / 2, h / 2, radius)
+    run_ffmpeg(["-f", "lavfi", "-i", f"color=black:s={w}x{h}:d=1,format=gray",
+                "-vf", f"geq=lum='255*clip(0.5-{sdf},0,1)'", "-frames:v", "1", path], "drawing the rounded mask")
+
+
+# ------------------------------------------------------------------ render
+
+def even(v):
+    return max(2, int(v) // 2 * 2)
+
+
+def render(opts):
+    video = os.path.abspath(opts.video)
+    if not os.path.isfile(video):
+        raise RenderError("not_found", f"No such video: {video}")
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            raise RenderError("missing_dependency", f"Missing: {tool}. Install with: sudo pacman -S ffmpeg")
+    info = probe(video)
+    w, h, fps, duration = info["w"], info["h"], info["fps"], info["duration"]
+    n_frames = max(1, int(round(duration * fps)))
+
+    events_path = opts.events or default_events_path(video)
+    have_events = os.path.isfile(events_path)
+    out = opts.out or os.path.splitext(video)[0] + "-studio.mp4"
+    if os.path.abspath(out) == video:
+        raise RenderError("usage", "--out must differ from the input video")
+
+    cursor, segments, clicks_v = [None] * n_frames, [], []
+    if have_events:
+        meta, moves, clicks, keys, end = load_events(events_path)
+        region = meta["region"]
+        sx, sy = w / float(region["w"]), h / float(region["h"])
+        # The tracker's end mark is written as the recorder is told to stop, so
+        # aligning ends absorbs the recorder's variable start-up delay.
+        offset = (end - duration) if end is not None else 0.0
+
+        def map_xy(x, y):
+            return (x - region["x"]) * sx, (y - region["y"]) * sy
+
+        cursor = sample_cursor(moves, n_frames, fps, offset, map_xy)
+        clicks_v = [t - offset for t in clicks if 0 <= t - offset < duration]
+        keys_v = [t - offset for t in keys if 0 <= t - offset < duration]
+        focus = clicks_v if (clicks_v or meta.get("input") == "evdev") else dwell_points(cursor, fps, sx)
+        if opts.zoom > 1.0:
+            segments = zoom_segments(focus, keys_v, duration)
+        cursor_scale = sx
+    else:
+        log(f"No events file ({events_path}); framing only.")
+        cursor_scale = 1.0
+
+    camera = camera_path(cursor, n_frames, fps, w, h, segments, max(1.0, opts.zoom))
+
+    # Output canvas keeps the recording's size; the card sits inside the padding.
+    cw, ch = even(w), even(h)
+    pad = max(0.0, min(0.3, opts.padding))
+    iw, ih = even(cw * (1 - 2 * pad)), even(ch * (1 - 2 * pad))
+    ox, oy = (cw - iw) // 2, (ch - ih) // 2
+    radius = max(0.0, opts.radius if opts.radius is not None else 0.018 * ch) if pad > 0 else 0.0
+
+    work = tempfile.mkdtemp(prefix="creator-mode-studio-", dir=os.environ.get("XDG_RUNTIME_DIR") or None)
+    try:
+        inputs = ["-i", video]
+        graph = []
+        src = "[0:v]"
+        draw_cursor = have_events and not opts.no_cursor and any(p is not None for p in cursor)
+
+        if draw_cursor:
+            cursor_png, ring_png = os.path.join(work, "cursor.png"), os.path.join(work, "ring.png")
+            cur_w, cur_h, hot_x, hot_y = make_cursor(cursor_png, 22 * cursor_scale * opts.cursor_scale)
+            ring_size = make_ring(ring_png, 14 * cursor_scale, 3 * cursor_scale)
+            smooth_x = Spring(0.0, 420.0, 0.85)
+            smooth_y = Spring(0.0, 420.0, 0.85)
+            click_frames = sorted(int(t * fps) for t in clicks_v)
+            ci, ring_until, ring_pos = 0, -1, None
+            lines, last = [], None
+            dt = 1.0 / fps
+            started = False
+            for n in range(n_frames):
+                pos = cursor[n]
+                if pos is not None and not started:
+                    smooth_x.value, smooth_y.value = pos
+                    started = True
+                if pos is not None:
+                    px, py = smooth_x.step(pos[0], dt), smooth_y.step(pos[1], dt)
+                    visible = -2 <= pos[0] <= w + 2 and -2 <= pos[1] <= h + 2
+                else:
+                    visible = False
+                while ci < len(click_frames) and click_frames[ci] <= n:
+                    if pos is not None:
+                        ring_until, ring_pos = n + int(CLICK_RING_TIME * fps), (px, py)
+                    ci += 1
+                cx, cy = (int(round(px - hot_x)), int(round(py - hot_y))) if visible else (-10000, -10000)
+                rx, ry = ((int(round(ring_pos[0] - ring_size / 2)), int(round(ring_pos[1] - ring_size / 2)))
+                          if n <= ring_until and ring_pos else (-10000, -10000))
+                state = (cx, cy, rx, ry)
+                if state != last:
+                    cmds = []
+                    if last is None or (cx, cy) != last[:2]:
+                        cmds += [f"overlay@cursor x {cx}", f"overlay@cursor y {cy}"]
+                    if last is None or (rx, ry) != last[2:]:
+                        cmds += [f"overlay@ring x {rx}", f"overlay@ring y {ry}"]
+                    lines.append(f"{n / fps:.4f} " + ", ".join(cmds) + ";")
+                    last = state
+            cmd_file = os.path.join(work, "cursor.cmd")
+            with open(cmd_file, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-i", ring_png,
+                       "-loop", "1", "-framerate", f"{fps:g}", "-i", cursor_png]
+            graph.append(f"{src}sendcmd=f='{cmd_file}'[s0]")
+            graph.append("[s0][1:v]overlay@ring=x=-10000:y=-10000:shortest=1[s1]")
+            graph.append("[s1][2:v]overlay@cursor=x=-10000:y=-10000:shortest=1[s2]")
+            src = "[s2]"
+            next_input = 3
+        else:
+            next_input = 1
+
+        if any(z > 1.0005 for z, _, _ in camera):
+            step = max(1, int(round(fps / 15)))
+            left = [cx - w / (2 * z) for z, cx, cy in camera]
+            top = [cy - h / (2 * z) for z, cx, cy in camera]
+            right = [cx + w / (2 * z) - w for z, cx, cy in camera]
+            bottom = [cy + h / (2 * z) - h for z, cx, cy in camera]
+            L, T = piecewise_expr(left, step), piecewise_expr(top, step)
+            R, B = f"W+{piecewise_expr(right, step)}", f"H+{piecewise_expr(bottom, step)}"
+            graph.append(f"{src}perspective=x0='{L}':y0='{T}':x1='{R}':y1='{T}':x2='{L}':y2='{B}':x3='{R}':y3='{B}'"
+                         f":interpolation=cubic:eval=frame[z]")
+            src = "[z]"
+
+        if pad > 0:
+            backdrop, mask = os.path.join(work, "backdrop.png"), os.path.join(work, "mask.png")
+            make_backdrop(backdrop, cw, ch, (ox, oy, iw, ih), radius, opts.background)
+            make_mask(mask, iw, ih, radius)
+            inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-i", backdrop,
+                       "-loop", "1", "-framerate", f"{fps:g}", "-i", mask]
+            b, m = next_input, next_input + 1
+            graph.append(f"{src}scale={iw}:{ih}:flags=lanczos,format=yuva420p[c0]")
+            graph.append(f"[{m}:v]format=gray,scale={iw}:{ih}[mk]")
+            graph.append("[c0][mk]alphamerge[c1]")
+            graph.append(f"[{b}:v][c1]overlay={ox}:{oy}:shortest=1:format=auto,format=yuv420p[out]")
+        else:
+            graph.append(f"{src}scale={cw}:{ch},format=yuv420p[out]")
+
+        script = os.path.join(work, "graph.txt")
+        with open(script, "w") as f:
+            f.write(";\n".join(graph))
+
+        tmp_out = os.path.join(os.path.dirname(os.path.abspath(out)), "." + os.path.basename(out) + ".part.mp4")
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-y"] + inputs + [
+            ffmpeg_script_flag(), script, "-map", "[out]"]
+        if info["audio"]:
+            cmd += ["-map", "0:a?", "-c:a", "copy"]
+        cmd += ["-c:v", "libx264", "-preset", opts.preset, "-crf", str(opts.crf), "-pix_fmt", "yuv420p",
+                "-r", f"{fps:g}", "-t", f"{duration:.3f}", "-movflags", "+faststart",
+                "-progress", "pipe:1", tmp_out]
+        log(f"Rendering {os.path.basename(out)} ({len(segments)} zoom{'s' if len(segments) != 1 else ''})…")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            last_pct = -1
+            for line in proc.stdout:
+                key, _, val = line.strip().partition("=")
+                if key == "out_time_us" and val.isdigit():
+                    pct = min(99, int(int(val) / 1e6 / duration * 100))
+                    if pct != last_pct:
+                        last_pct = pct
+                        emit({"progress": pct / 100})
+                        if not JSON_MODE:
+                            print(f"\r{pct:3d}%", end="", file=sys.stderr, flush=True)
+            err = proc.stderr.read()
+        except BaseException:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+            raise
+        if proc.wait() != 0:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+            raise RenderError("ffmpeg_failed", f"ffmpeg failed while rendering: {err.strip()[-400:]}")
+        os.replace(tmp_out, out)
+        if not JSON_MODE:
+            print("\r100%", file=sys.stderr)
+        return {"ok": True, "file": out, "duration": duration, "zooms": len(segments),
+                "cursor": draw_cursor, "events": events_path if have_events else None}
+    finally:
+        if not opts.keep_temp:
+            shutil.rmtree(work, ignore_errors=True)
+        else:
+            log(f"Kept work dir: {work}")
+
+
+def interrupted(signum, _frame):
+    raise KeyboardInterrupt
+
+
+def main():
+    global JSON_MODE
+    parser = argparse.ArgumentParser(prog="creator-mode-studio", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("render", help="render the studio cut of a recording")
+    r.add_argument("video")
+    r.add_argument("--events", help="events file (default: next to the video in .creator-mode/)")
+    r.add_argument("--out", help="output file (default: <video>-studio.mp4)")
+    r.add_argument("--zoom", type=float, default=1.8, help="zoom level on clicks; 1 disables zoom (default 1.8)")
+    r.add_argument("--background", default="theme",
+                   help=f"theme | {' | '.join(PRESETS)} | #rrggbb[:#rrggbb] | image path (default theme)")
+    r.add_argument("--padding", type=float, default=0.06, help="padding as a fraction of the frame; 0 = no frame")
+    r.add_argument("--radius", type=float, help="corner radius in px (default ~1.8%% of the height)")
+    r.add_argument("--cursor-scale", type=float, default=1.4, help="cursor size multiplier (default 1.4)")
+    r.add_argument("--no-cursor", action="store_true", help="don't draw a cursor")
+    r.add_argument("--preset", default="medium", help="x264 preset (default medium)")
+    r.add_argument("--crf", type=int, default=18, help="x264 quality, lower is better (default 18)")
+    r.add_argument("--json-progress", action="store_true", help="machine-readable progress on stdout")
+    r.add_argument("--keep-temp", action="store_true", help=argparse.SUPPRESS)
+    opts = parser.parse_args()
+    JSON_MODE = opts.json_progress
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
+    try:
+        result = render(opts)
+    except RenderError as e:
+        if JSON_MODE:
+            emit({"ok": False, "error": e.code, "message": e.message})
+        else:
+            print(f"creator-mode-studio: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    if JSON_MODE:
+        emit(result)
+    else:
+        print(result["file"])
+
+
+if __name__ == "__main__":
+    main()

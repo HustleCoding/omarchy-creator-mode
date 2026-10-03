@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""creator-mode-track: log the cursor (and, if readable, clicks/keys) during a recording.
+
+    creator-mode-track --out EVENTS.jsonl --region X,Y,W,H
+
+The region is the captured area in Hyprland's logical (global) coordinates.
+Cursor positions come from Hyprland's IPC socket (`j/cursorpos`), polled at
+~60 Hz. Mouse buttons and key presses are read from /dev/input/event* when the
+user can read them (member of the `input` group); otherwise only the cursor is
+logged and the renderer infers focus points from where the cursor rests.
+Which key was pressed is never recorded, only that one was.
+
+Output is JSON lines. The first line is a header; `t` is seconds since the
+header's `start` (wall clock). SIGTERM/SIGINT writes an `end` line and exits.
+"""
+
+import argparse
+import glob
+import json
+import os
+import select
+import signal
+import socket
+import struct
+import sys
+import time
+
+EV_KEY = 1
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
+BTN_TOUCH = 0x14A
+TAP_MAX_SECONDS = 0.25
+MODIFIER_KEYS = {29, 42, 54, 56, 97, 100, 125, 126}
+EVENT_FORMAT = "llHHi"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+POLL_HZ = 60
+
+
+def hypr_socket_path():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if not sig:
+        return None
+    for base in (os.path.join(runtime, "hypr"), "/tmp/hypr"):
+        path = os.path.join(base, sig, ".socket.sock")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def cursor_pos(path):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        s.connect(path)
+        s.sendall(b"j/cursorpos")
+        chunks = []
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    data = json.loads(b"".join(chunks))
+    return float(data["x"]), float(data["y"])
+
+
+def open_input_devices():
+    fds = []
+    for path in sorted(glob.glob("/dev/input/event*")):
+        try:
+            fds.append(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+    return fds
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--region", required=True, help="X,Y,W,H in logical coordinates")
+    parser.add_argument("--no-input", action="store_true", help="don't read /dev/input")
+    args = parser.parse_args()
+
+    try:
+        rx, ry, rw, rh = (float(v) for v in args.region.split(","))
+    except ValueError:
+        sys.exit("creator-mode-track: --region must be X,Y,W,H")
+
+    sock = os.environ.get("CREATOR_MODE_HYPR_SOCKET") or hypr_socket_path()
+    if not sock:
+        sys.exit("creator-mode-track: Hyprland IPC socket not found")
+    try:
+        cursor_pos(sock)
+    except (OSError, ValueError, KeyError) as e:
+        sys.exit(f"creator-mode-track: can't read the cursor position: {e}")
+
+    fds = [] if args.no_input else open_input_devices()
+    start = time.time()
+    out = open(args.out, "w", buffering=1)
+    header = {
+        "type": "meta",
+        "version": 1,
+        "start": start,
+        "region": {"x": rx, "y": ry, "w": rw, "h": rh},
+        "input": "evdev" if fds else "none",
+    }
+    out.write(json.dumps(header) + "\n")
+
+    stopping = False
+
+    def stop(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    def emit(obj):
+        out.write(json.dumps(obj, separators=(",", ":")) + "\n")
+
+    last = None
+    touch_down = {}
+    interval = 1.0 / POLL_HZ
+    next_poll = time.monotonic()
+    failures = 0
+
+    while not stopping:
+        now_mono = time.monotonic()
+        if now_mono >= next_poll:
+            next_poll = now_mono + interval
+            try:
+                pos = cursor_pos(sock)
+                failures = 0
+            except (OSError, ValueError, KeyError):
+                failures += 1
+                if failures > POLL_HZ * 5:
+                    break
+                pos = None
+            if pos is not None and pos != last:
+                last = pos
+                emit({"t": round(time.time() - start, 4), "x": pos[0], "y": pos[1]})
+
+        timeout = max(0.0, next_poll - time.monotonic())
+        if not fds:
+            time.sleep(timeout)
+            continue
+        try:
+            ready, _, _ = select.select(fds, [], [], timeout)
+        except InterruptedError:
+            continue
+        for fd in ready:
+            try:
+                data = os.read(fd, EVENT_SIZE * 64)
+            except BlockingIOError:
+                continue
+            except OSError:
+                fds.remove(fd)
+                continue
+            t = round(time.time() - start, 4)
+            for off in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
+                _sec, _usec, etype, code, value = struct.unpack_from(EVENT_FORMAT, data, off)
+                if etype != EV_KEY:
+                    continue
+                if code in (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE) and value == 1:
+                    emit({"t": t, "type": "click", "button": code - BTN_LEFT})
+                elif code == BTN_TOUCH:
+                    if value == 1:
+                        touch_down[fd] = t
+                    elif value == 0 and fd in touch_down:
+                        if t - touch_down.pop(fd) <= TAP_MAX_SECONDS:
+                            emit({"t": t, "type": "click", "button": 0, "tap": True})
+                elif 0 < code < 0x100 and value == 1 and code not in MODIFIER_KEYS:
+                    emit({"t": t, "type": "key"})
+
+    emit({"t": round(time.time() - start, 4), "type": "end"})
+    out.close()
+    for fd in fds:
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    main()

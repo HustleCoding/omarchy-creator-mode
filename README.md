@@ -8,8 +8,38 @@ the active theme, and it installs only into your home directory.
 ```
 SUPER + ALT + R   → panel (idle)
 Enter             → 3 · 2 · 1 → REC ● 00:12   (top-center pill, not captured as a modal)
-SUPER + ALT + R   → Saving… → "Recording saved" · path · O Open folder
+SUPER + ALT + R   → Saving… → Rendering studio cut 42% → "Studio cut saved" · path · O Open folder
 ```
+
+## Studio mode (Screen Studio-style cut)
+
+Studio is on by default (`S` toggles it, `B` cycles the background). While recording, `bin/creator-mode-track`
+logs the cursor from Hyprland's IPC socket (~60 Hz) and, if `/dev/input/event*` is readable, mouse clicks and
+the *fact* that a key was pressed (never which key). The real cursor is hidden in the capture
+(`gpu-screen-recorder -cursor no`, only when the installed recorder supports it and the tracker is running).
+After you stop, `bin/creator-mode-studio` renders `<name>-studio.mp4` next to the raw file:
+
+- **Auto-zoom** (1.8×) eased in just before each click, held while you click/type nearby, and spring-animated
+  back out; the camera follows the cursor with a dead zone instead of jittering.
+- **Smooth cursor** redrawn from the log (spring-smoothed, 1.4× size) with a **click ring**.
+- **Framing:** padding, rounded corners, soft drop shadow, and a gradient background from the current
+  Omarchy theme (or `midnight`, `sunset`, `ocean`, `forest`, `mono`, `#rrggbb[:#rrggbb]`, or an image path).
+- Audio is copied untouched. The raw recording is never modified; a failed or skipped render (`Esc`)
+  still leaves it saved.
+
+Without access to `/dev/input` (you're not in the `input` group), clicks can't be seen and zooms follow
+where the cursor comes to rest instead. For click-accurate zooms: `sudo usermod -aG input $USER` and log in
+again. If the tracker can't start at all, Creator Mode records a normal video with the real cursor.
+
+Re-render any recording with other settings:
+
+```bash
+~/.config/omarchy/plugins/hustlecoding.creator-mode/bin/creator-mode-studio render ~/Videos/creator-mode-….mp4 \
+  --background sunset --zoom 2.2 --padding 0.08
+```
+
+Events are kept in `<recordings dir>/.creator-mode/<name>.events.jsonl` (cursor positions, click and keypress
+times only).
 
 ## Compatibility findings (Omarchy 4.0.4)
 
@@ -64,17 +94,18 @@ Keys:
 
 | State | Keys |
 | --- | --- |
-| idle | `Enter`/`Space`/`R` full screen · `P` pick area/window/monitor, then countdown · `A` cycle audio (none → desktop → desktop+mic) · `Esc`/`Q` close |
+| idle | `Enter`/`Space`/`R` full screen · `P` pick area/window/monitor, then countdown · `A` cycle audio (none → desktop → desktop+mic) · `S` studio on/off · `B` cycle background · `Esc`/`Q` close |
 | picking | Omarchy's picker keys: drag an area, click a window, `Enter` highlighted window, `Ctrl + Enter` whole monitor, `Esc` cancels back to idle |
 | countdown | `Esc` or the hotkey cancels |
 | recording | hotkey (`SUPER + ALT + R`) stops |
+| rendering | `Esc` skips the studio cut (raw recording stays saved) |
 | saved | `O` open folder · `Enter` new recording · `Esc` done |
 | error | `Enter` retry · `Esc` close |
 
 ## Dependencies
 
 Everything below ships with a standard Omarchy 4.0.4 install:
-`gpu-screen-recorder`, `ffmpeg` (for `ffprobe`), `util-linux` (for `flock`), `hyprland` (for `hyprctl`), `jq`, `xdg-utils`, plus Omarchy's `omarchy-shell` / `omarchy-plugin-*`.
+`gpu-screen-recorder`, `ffmpeg` (`ffprobe`, and the studio render), `python` (studio tracker/renderer, standard library only), `util-linux` (for `flock`), `hyprland` (for `hyprctl`), `jq`, `xdg-utils`, plus Omarchy's `omarchy-shell` / `omarchy-plugin-*`.
 If one is missing, the panel names it and shows the install command (`sudo pacman -S …`). The installer warns too.
 
 No network, paid services, or AI APIs are used.
@@ -205,8 +236,10 @@ Run on the Omarchy desktop after `./install.sh`.
 ```bash
 bash -n bin/creator-mode-rec
 shellcheck -x bin/creator-mode-rec install.sh uninstall.sh test/*.sh test/fake-recorder test/stand-in-recorder
-./test/controller-test.sh        # needs ffmpeg/ffprobe + flock; uses the fake recorder
+python3 -m py_compile bin/creator-mode-track bin/creator-mode-studio
+./test/controller-test.sh        # needs ffmpeg/ffprobe + flock; fake recorder + fake Hyprland socket
 ```
 
 Environment overrides (for testing only): `CREATOR_MODE_RECORDER`, `CREATOR_MODE_MONITOR`,
-`CREATOR_MODE_STATE_DIR`, `CREATOR_MODE_START_TIMEOUT`, `CREATOR_MODE_STOP_TIMEOUT`.
+`CREATOR_MODE_STATE_DIR`, `CREATOR_MODE_START_TIMEOUT`, `CREATOR_MODE_STOP_TIMEOUT`, `CREATOR_MODE_REGION`
+(logical `X,Y,W,H` of the capture), `CREATOR_MODE_HYPR_SOCKET`, `CREATOR_MODE_TRACKER`, `CREATOR_MODE_STUDIO`.

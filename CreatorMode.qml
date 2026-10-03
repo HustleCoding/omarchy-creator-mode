@@ -20,7 +20,7 @@ Item {
   property string hotkeyLabel: "Super + Alt + R"
 
   property bool opened: false
-  property string phase: "idle"   // idle | picking | countdown | starting | recording | saving | saved | error
+  property string phase: "idle"   // idle | picking | countdown | starting | recording | saving | rendering | saved | error
   property int count: 3
   property string notice: ""
 
@@ -28,6 +28,19 @@ Item {
   readonly property var audioLabels: ({ "none": "No audio", "desktop": "Desktop audio", "desktop+mic": "Desktop + mic" })
   property int audioIndex: 0
   readonly property string audioMode: audioModes[audioIndex]
+
+  // Studio: log the cursor while recording, then render an auto-zoomed,
+  // framed cut next to the raw file (bin/creator-mode-studio).
+  property bool studioAvailable: true
+  property bool studioEnabled: true
+  readonly property bool studioOn: studioAvailable && studioEnabled
+  readonly property var backgrounds: ["theme", "midnight", "sunset", "ocean", "forest", "mono"]
+  property int backgroundIndex: 0
+  readonly property string background: backgrounds[backgroundIndex]
+  property bool recordingTracked: false
+  property real renderProgress: 0
+  property string studioFile: ""
+  property string studioNotice: ""
 
   property string captureTarget: "focused"
   property string captureLabel: "Full screen · focused monitor"
@@ -43,7 +56,7 @@ Item {
   property string errorMessage: ""
   property bool foreignRecording: false
 
-  readonly property bool cardVisible: opened && ["idle", "countdown", "saved", "error"].indexOf(phase) !== -1
+  readonly property bool cardVisible: opened && ["idle", "countdown", "rendering", "saved", "error"].indexOf(phase) !== -1
   readonly property bool pillVisible: ["starting", "recording", "saving"].indexOf(phase) !== -1
 
   // Theme
@@ -159,8 +172,51 @@ Item {
   }
 
   function revealFolder() {
-    if (!root.recordingFile) return
-    run("reveal", ["reveal", root.recordingFile])
+    var file = root.studioFile || root.recordingFile
+    if (!file) return
+    run("reveal", ["reveal", file])
+  }
+
+  function toggleStudio() {
+    if (!root.studioAvailable) { root.notice = "Studio needs python3 and ffmpeg"; return }
+    root.studioEnabled = !root.studioEnabled
+  }
+
+  function cycleBackground() {
+    root.backgroundIndex = (root.backgroundIndex + 1) % root.backgrounds.length
+  }
+
+  function startRender() {
+    root.renderProgress = 0
+    root.studioFile = ""
+    root.phase = "rendering"
+    root.opened = true
+    Qt.callLater(function() { keys.forceActiveFocus() })
+    renderProc.result = null
+    renderProc.command = ["bash", root.controller, "render", root.recordingFile, "--background=" + root.background]
+    renderProc.running = true
+  }
+
+  function cancelRender() {
+    if (root.phase !== "rendering") return
+    renderProc.cancelled = true
+    renderProc.running = false
+  }
+
+  function finishRender(exitCode) {
+    var result = renderProc.result
+    if (renderProc.cancelled) {
+      root.studioNotice = "Studio render cancelled; the raw recording is saved."
+    } else if (result && result.ok) {
+      root.studioFile = result.file
+      root.studioNotice = ""
+    } else {
+      root.studioNotice = "Studio render failed: " + ((result && result.message) || ("exit " + exitCode)) + " The raw recording is saved."
+    }
+    renderProc.cancelled = false
+    root.phase = "saved"
+    root.opened = true
+    Qt.callLater(function() { keys.forceActiveFocus() })
   }
 
   function fail(title, message) {
@@ -225,6 +281,7 @@ Item {
     if (action === "check") {
       if (!result.ok) { root.fail("Can't record yet", result.message); return }
       root.outputDir = result.outputDir || ""
+      root.studioAvailable = result.studio !== false
       run("status", ["status"])
       return
     }
@@ -272,6 +329,8 @@ Item {
       root.recordingFile = result.file
       root.startedAt = Number(result.startedAt) || Date.now()
       root.nowMs = Date.now()
+      root.recordingTracked = result.studio === true
+      root.studioNotice = result.notice || ""
       root.phase = "recording"
       return
     }
@@ -291,6 +350,11 @@ Item {
       root.savedDuration = Number(result.duration) || 0
       root.savedSize = Number(result.size) || 0
       root.savedRecovered = result.recovered === true
+      root.studioFile = ""
+      if (root.studioOn && typeof result.events === "string" && result.events !== "") {
+        root.startRender()
+        return
+      }
       root.phase = "saved"
       root.opened = true
       Qt.callLater(function() { keys.forceActiveFocus() })
@@ -318,6 +382,21 @@ Item {
     }
   }
 
+  Process {
+    id: renderProc
+    property var result: null
+    property bool cancelled: false
+    stdout: SplitParser {
+      onRead: function(line) {
+        var msg = null
+        try { msg = JSON.parse(line) } catch (e) { return }
+        if (typeof msg.progress === "number") root.renderProgress = msg.progress
+        else renderProc.result = msg
+      }
+    }
+    onExited: function(exitCode) { root.finishRender(exitCode) }
+  }
+
   Timer {
     id: countdownTimer
     interval: 1000
@@ -343,7 +422,8 @@ Item {
   Timer {
     id: startDelay
     interval: 250
-    onTriggered: root.run("start", ["start", "--audio=" + root.audioMode, "--target=" + root.captureTarget])
+    onTriggered: root.run("start", ["start", "--audio=" + root.audioMode, "--target=" + root.captureTarget,
+                                     "--studio=" + (root.studioOn ? "on" : "off")])
   }
 
   Timer {
@@ -451,7 +531,7 @@ Item {
 
     MouseArea {
       anchors.fill: parent
-      onClicked: if (root.phase !== "countdown") root.dismiss()
+      onClicked: if (root.phase !== "countdown" && root.phase !== "rendering") root.dismiss()
     }
 
     Item {
@@ -469,7 +549,12 @@ Item {
           if (k === Qt.Key_Return || k === Qt.Key_Enter || k === Qt.Key_Space || k === Qt.Key_R) root.recordFullScreen()
           else if (k === Qt.Key_P) root.pickArea()
           else if (k === Qt.Key_A) root.audioIndex = (root.audioIndex + 1) % root.audioModes.length
+          else if (k === Qt.Key_S) root.toggleStudio()
+          else if (k === Qt.Key_B && root.studioOn) root.cycleBackground()
           else if (k === Qt.Key_Escape || k === Qt.Key_Q) root.dismiss()
+          else handled = false
+        } else if (s === "rendering") {
+          if (k === Qt.Key_Escape) root.cancelRender()
           else handled = false
         } else if (s === "saved") {
           if (k === Qt.Key_O) root.revealFolder()
@@ -547,6 +632,16 @@ Item {
           }
           Text {
             width: parent.width
+            wrapMode: Text.Wrap
+            text: root.studioOn
+              ? "Studio on · auto-zoom, smooth cursor, " + root.background + " background"
+              : (root.studioAvailable ? "Studio off · raw recording only" : "Studio unavailable (needs python3 + ffmpeg)")
+            color: root.studioOn ? root.accent : root.muted
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
+          Text {
+            width: parent.width
             visible: root.outputDir !== ""
             elide: Text.ElideMiddle
             text: "Saves to " + root.outputDir
@@ -570,6 +665,8 @@ Item {
           KeyAction { keyLabel: "Enter"; label: "Full screen"; primary: true; onActivated: root.recordFullScreen() }
           KeyAction { keyLabel: "P"; label: "Pick area"; onActivated: root.pickArea() }
           KeyAction { keyLabel: "A"; label: "Audio"; onActivated: root.audioIndex = (root.audioIndex + 1) % root.audioModes.length }
+          KeyAction { keyLabel: "S"; label: "Studio"; onActivated: root.toggleStudio() }
+          KeyAction { keyLabel: "B"; label: "Background"; visible: root.studioOn; onActivated: root.cycleBackground() }
           KeyAction { keyLabel: "Esc"; label: "Close"; onActivated: root.dismiss() }
         }
 
@@ -616,6 +713,49 @@ Item {
           }
         }
 
+        // ---- rendering
+        Column {
+          visible: root.phase === "rendering"
+          width: parent.width
+          spacing: Style.space(12)
+
+          Text {
+            text: "Rendering studio cut"
+            color: root.text
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.displayLarge
+            font.bold: true
+          }
+          Text {
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: Math.round(root.renderProgress * 100) + "% · auto-zoom, cursor and " + root.background + " background · the raw recording is already saved"
+            color: root.muted
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+          }
+          Rectangle {
+            width: parent.width
+            height: Style.space(8)
+            radius: height / 2
+            color: Util.alpha(root.text, 0.12)
+            Rectangle {
+              width: parent.width * Math.max(0, Math.min(1, root.renderProgress))
+              height: parent.height
+              radius: parent.radius
+              color: root.accent
+              Behavior on width { NumberAnimation { duration: 200 } }
+            }
+          }
+        }
+
+        Flow {
+          visible: root.phase === "rendering"
+          width: parent.width
+          spacing: Style.space(10)
+          KeyAction { keyLabel: "Esc"; label: "Skip studio cut"; onActivated: root.cancelRender() }
+        }
+
         // ---- saved
         Column {
           visible: root.phase === "saved"
@@ -623,7 +763,7 @@ Item {
           spacing: Style.space(10)
 
           Text {
-            text: "Recording saved"
+            text: root.studioFile ? "Studio cut saved" : "Recording saved"
             color: root.text
             font.family: root.fontFamily
             font.pixelSize: Style.font.displayLarge
@@ -644,6 +784,15 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
           }
+          Text {
+            visible: root.studioNotice !== ""
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: root.studioNotice
+            color: root.muted
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
           Rectangle {
             width: parent.width
             height: pathText.implicitHeight + Style.space(20)
@@ -657,7 +806,7 @@ Item {
               anchors.margins: Style.space(10)
               verticalAlignment: Text.AlignVCenter
               wrapMode: Text.WrapAnywhere
-              text: root.recordingFile
+              text: root.studioFile ? root.studioFile + "\nRaw: " + root.recordingFile : root.recordingFile
               color: root.text
               font.family: root.fontFamily
               font.pixelSize: Style.font.subtitle

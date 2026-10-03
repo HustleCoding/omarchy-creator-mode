@@ -5,10 +5,15 @@
 #   creator-mode-rec check                       dependencies + output dir
 #   creator-mode-rec status                      idle | recording | crashed
 #   creator-mode-rec pick                        Omarchy's region/window/monitor picker
-#   creator-mode-rec start [--audio=MODE] [--target=TARGET]
+#   creator-mode-rec start [--audio=MODE] [--target=TARGET] [--studio=on|off]
 #                                                MODE: none | desktop | desktop+mic
 #                                                TARGET: focused | monitor:NAME | region:WxH+X+Y
+#                                                studio: also log the cursor/clicks for
+#                                                the studio render (and hide the real cursor)
 #   creator-mode-rec stop                        stop OUR recording and verify the file
+#   creator-mode-rec render <file> [--background=BG] [--zoom=N]
+#                                                studio cut: auto-zoom, smooth cursor, frame;
+#                                                streams {"progress":0..1} lines, then the result
 #   creator-mode-rec reveal <file>               open the folder containing <file>
 #
 # Every command prints exactly one JSON object on stdout. Failures also exit
@@ -27,6 +32,10 @@ RECORDER="${CREATOR_MODE_RECORDER:-gpu-screen-recorder}"
 START_TIMEOUT="${CREATOR_MODE_START_TIMEOUT:-8}"
 STOP_TIMEOUT="${CREATOR_MODE_STOP_TIMEOUT:-20}"
 PICKER="${CREATOR_MODE_PICKER:-omarchy-capture-region}"
+BIN_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+TRACKER="${CREATOR_MODE_TRACKER:-$BIN_DIR/creator-mode-track}"
+STUDIO="${CREATOR_MODE_STUDIO:-$BIN_DIR/creator-mode-studio}"
+TRACKER_LOG="$STATE_DIR/tracker.log"
 
 json_str() {
   local s
@@ -104,10 +113,14 @@ load_state() {
   PID=""
   FILE=""
   STARTED=""
+  TRACKER_PID=""
+  EVENTS=""
   [[ -f $STATE_FILE ]] || return 1
   PID=$(sed -n 's/^pid=//p' "$STATE_FILE")
   FILE=$(sed -n 's/^file=//p' "$STATE_FILE")
   STARTED=$(sed -n 's/^started=//p' "$STATE_FILE")
+  TRACKER_PID=$(sed -n 's/^tracker_pid=//p' "$STATE_FILE")
+  EVENTS=$(sed -n 's/^events=//p' "$STATE_FILE")
   [[ $PID =~ ^[0-9]+$ && -n $FILE ]]
 }
 
@@ -118,6 +131,48 @@ is_ours_alive() {
   local cmdline
   cmdline=$(tr '\0' '\n' <"/proc/$PID/cmdline" 2>/dev/null) || return 1
   grep -qxF -- "$FILE" <<<"$cmdline"
+}
+
+# Same PID-reuse guard for the cursor tracker: it must still be writing EVENTS.
+tracker_alive() {
+  [[ ${TRACKER_PID:-} =~ ^[0-9]+$ && -n ${EVENTS:-} && -r /proc/$TRACKER_PID/cmdline ]] || return 1
+  tr '\0' '\n' <"/proc/$TRACKER_PID/cmdline" 2>/dev/null | grep -qxF -- "$EVENTS"
+}
+
+stop_tracker() {
+  tracker_alive || return 0
+  kill -TERM "$TRACKER_PID" 2>/dev/null
+  local waited=0
+  while tracker_alive && ((waited < 20)); do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  tracker_alive && kill -KILL "$TRACKER_PID" 2>/dev/null
+  return 0
+}
+
+studio_available() {
+  command -v python3 >/dev/null 2>&1 && command -v ffmpeg >/dev/null 2>&1 && [[ -x $TRACKER && -x $STUDIO ]]
+}
+
+# The captured area as X,Y,W,H in Hyprland's logical coordinates (what the
+# cursor IPC reports), for mapping cursor positions onto the video.
+logical_region() {
+  local target=$1
+  if [[ -n ${CREATOR_MODE_REGION:-} ]]; then
+    echo "$CREATOR_MODE_REGION"
+  elif [[ $target =~ ^region:([0-9]+)x([0-9]+)\+(-?[0-9]+)\+(-?[0-9]+)$ ]]; then
+    echo "${BASH_REMATCH[3]},${BASH_REMATCH[4]},${BASH_REMATCH[1]},${BASH_REMATCH[2]}"
+  else
+    hyprctl monitors -j 2>/dev/null | jq -r --arg name "${target#monitor:}" '
+      .[] | select(.name == $name)
+      | (if (.transform % 2) == 1 then [.height, .width] else [.width, .height] end) as $wh
+      | "\(.x),\(.y),\($wh[0] / .scale | round),\($wh[1] / .scale | round)"' | head -n1
+  fi
+}
+
+recorder_can_hide_cursor() {
+  "$RECORDER" --help 2>&1 | grep -qE -- '(^|[[:space:]])-cursor([[:space:]]|$)'
 }
 
 foreign_recorder_running() {
@@ -175,7 +230,8 @@ cmd_check() {
     fail "missing_dependency" "Missing: $missing. Install with: sudo pacman -S ${pkgs[*]}"
   fi
   dir=$(ensure_output_dir) || exit 1
-  printf '{"ok":true,"outputDir":%s,"recorder":%s}\n' "$(json_str "$dir")" "$(json_str "$RECORDER")"
+  printf '{"ok":true,"outputDir":%s,"recorder":%s,"studio":%s}\n' "$(json_str "$dir")" "$(json_str "$RECORDER")" \
+    "$(studio_available && echo true || echo false)"
 }
 
 cmd_status() {
@@ -217,15 +273,17 @@ cmd_pick() {
 }
 
 cmd_start() {
-  local audio="none" target="focused" arg
+  local audio="none" target="focused" studio="off" arg
   for arg in "$@"; do
     case $arg in
     --audio=*) audio=${arg#*=} ;;
     --target=*) target=${arg#*=} ;;
+    --studio=*) studio=${arg#*=} ;;
     *) fail "usage" "Unknown option: $arg" ;;
     esac
   done
   case $audio in none | desktop | desktop+mic) ;; *) fail "usage" "Unknown audio mode: $audio" ;; esac
+  case $studio in on | off) ;; *) fail "usage" "Unknown studio mode: $studio" ;; esac
   [[ $target == "focused" || $target =~ ^monitor:[A-Za-z0-9._-]+$ || $target =~ ^region:[0-9]+x[0-9]+\+-?[0-9]+\+-?[0-9]+$ ]] ||
     fail "usage" "Unknown capture target: $target"
 
@@ -274,13 +332,43 @@ cmd_start() {
   desktop+mic) audio_args=(-a "default_output|default_input" -ac aac) ;;
   esac
 
+  # Studio: start the tracker first so the real cursor is only hidden once
+  # something is logging it; any tracker problem degrades to a plain recording.
+  local tracker_pid="" events="" studio_note="" cursor_args=()
+  if [[ $studio == "on" ]]; then
+    local region monitor_target=$target
+    [[ $target == "focused" ]] && monitor_target="monitor:$monitor"
+    region=$(logical_region "$monitor_target")
+    if ! studio_available; then
+      studio_note="Studio needs python3 and ffmpeg; recording without it."
+    elif [[ ! $region =~ ^-?[0-9]+,-?[0-9]+,[0-9]+,[0-9]+$ ]]; then
+      studio_note="Couldn't work out the capture area; recording without studio tracking."
+    elif ! mkdir -p "$dir/.creator-mode" 2>/dev/null; then
+      studio_note="Can't write $dir/.creator-mode; recording without studio tracking."
+    else
+      events="$dir/.creator-mode/$(basename "${file%.mp4}").events.jsonl"
+      : >"$TRACKER_LOG"
+      setsid python3 "$TRACKER" --out "$events" --region "$region" </dev/null >>"$TRACKER_LOG" 2>&1 9>&- &
+      tracker_pid=$!
+      sleep 0.3
+      if ! kill -0 "$tracker_pid" 2>/dev/null; then
+        studio_note="Cursor tracking failed: $(tail -n1 "$TRACKER_LOG" | cut -c1-200)"
+        tracker_pid="" events=""
+      else
+        recorder_can_hide_cursor && cursor_args=(-cursor no)
+        grep -q '"input": "none"' "$events" 2>/dev/null &&
+          studio_note="Clicks aren't readable (add yourself to the input group); zooms follow where the cursor rests."
+      fi
+    fi
+  fi
+
   : >"$LOG_FILE"
   # setsid detaches the recorder from the shell process so restarting
   # omarchy-shell (or closing the panel) never interrupts a recording; 9>&- keeps
   # the long-lived recorder from inheriting (and holding) the control lock, and
   # --default-signal undoes the SIGINT-ignore bash applies to background jobs.
   setsid env --default-signal=INT "$RECORDER" "${capture_args[@]}" -k auto -f 60 -fm cfr -fallback-cpu-encoding yes \
-    -o "$file" "${audio_args[@]}" </dev/null >>"$LOG_FILE" 2>&1 9>&- &
+    "${cursor_args[@]}" -o "$file" "${audio_args[@]}" </dev/null >>"$LOG_FILE" 2>&1 9>&- &
   local pid=$!
 
   local deadline=$((EPOCHSECONDS + START_TIMEOUT))
@@ -288,9 +376,12 @@ cmd_start() {
     sleep 0.1
   done
 
+  TRACKER_PID=$tracker_pid EVENTS=$events
   if ! kill -0 "$pid" 2>/dev/null; then
     wait "$pid" 2>/dev/null
     local code=$?
+    stop_tracker
+    [[ -n $events ]] && rm -f "$events"
     rm -f "$file"
     local detail
     detail=$(log_tail)
@@ -301,17 +392,21 @@ cmd_start() {
     kill -INT "$pid" 2>/dev/null
     sleep 1
     kill -KILL "$pid" 2>/dev/null
+    stop_tracker
+    [[ -n $events ]] && rm -f "$events"
     rm -f "$file"
     fail "start_timeout" "The recorder didn't start writing within ${START_TIMEOUT}s." ",\"log\":$(json_str "$LOG_FILE")"
   fi
 
   local started
   started=$(now_ms)
-  printf 'pid=%s\nfile=%s\nstarted=%s\naudio=%s\ntarget=%s\n' "$pid" "$file" "$started" "$audio" "$target" >"$STATE_FILE.tmp"
+  printf 'pid=%s\nfile=%s\nstarted=%s\naudio=%s\ntarget=%s\ntracker_pid=%s\nevents=%s\n' \
+    "$pid" "$file" "$started" "$audio" "$target" "$tracker_pid" "$events" >"$STATE_FILE.tmp"
   mv "$STATE_FILE.tmp" "$STATE_FILE"
   refresh_omarchy_indicator
 
-  printf '{"ok":true,"state":"recording","pid":%s,"file":%s,"startedAt":%s}\n' "$pid" "$(json_str "$file")" "$started"
+  printf '{"ok":true,"state":"recording","pid":%s,"file":%s,"startedAt":%s,"studio":%s,"notice":%s}\n' \
+    "$pid" "$(json_str "$file")" "$started" "$([[ -n $events ]] && echo true || echo false)" "$(json_str "$studio_note")"
 }
 
 cmd_stop() {
@@ -320,6 +415,7 @@ cmd_stop() {
 
   if is_ours_alive; then
     kill -INT "$PID" 2>/dev/null
+    stop_tracker
     local waited=0 limit=$((STOP_TIMEOUT * 10))
     while is_ours_alive && ((waited < limit)); do
       sleep 0.1
@@ -327,6 +423,7 @@ cmd_stop() {
     done
     if is_ours_alive; then
       kill -KILL "$PID" 2>/dev/null
+      stop_tracker
       rm -f "$STATE_FILE"
       refresh_omarchy_indicator
       fail "save_timeout" "The recorder didn't finish saving within ${STOP_TIMEOUT}s and was force-stopped. The file may be incomplete." ",\"file\":$(json_str "$FILE")"
@@ -335,6 +432,7 @@ cmd_stop() {
   else
     CRASHED=true
   fi
+  stop_tracker
 
   rm -f "$STATE_FILE"
   refresh_omarchy_indicator
@@ -350,8 +448,30 @@ cmd_stop() {
   fi
   size=$(stat -c %s "$FILE")
 
-  printf '{"ok":true,"state":"saved","file":%s,"dir":%s,"duration":%s,"size":%s,"recovered":%s}\n' \
-    "$(json_str "$FILE")" "$(json_str "$(dirname "$FILE")")" "$duration" "$size" "$CRASHED"
+  local events_json=null
+  [[ -n $EVENTS && -s $EVENTS ]] && events_json=$(json_str "$EVENTS")
+
+  printf '{"ok":true,"state":"saved","file":%s,"dir":%s,"duration":%s,"size":%s,"recovered":%s,"events":%s}\n' \
+    "$(json_str "$FILE")" "$(json_str "$(dirname "$FILE")")" "$duration" "$size" "$CRASHED" "$events_json"
+}
+
+# Progress lines are passed through from creator-mode-studio; the last line is
+# the result. The raw recording is never modified.
+cmd_render() {
+  local file="" background="theme" zoom="1.8" arg
+  for arg in "$@"; do
+    case $arg in
+    --background=*) background=${arg#*=} ;;
+    --zoom=*) zoom=${arg#*=} ;;
+    -*) fail "usage" "Unknown option: $arg" ;;
+    *) [[ -z $file ]] || fail "usage" "render takes one file"; file=$arg ;;
+    esac
+  done
+  [[ -n $file ]] || fail "usage" "render needs a file path"
+  [[ -f $file ]] || fail "not_found" "Recording no longer exists: $file"
+  [[ $zoom =~ ^[0-9]+(\.[0-9]+)?$ ]] || fail "usage" "Zoom must be a number: $zoom"
+  studio_available || fail "missing_dependency" "Studio needs python3 and ffmpeg. Install with: sudo pacman -S python ffmpeg"
+  exec python3 "$STUDIO" render "$file" --background="$background" --zoom="$zoom" --json-progress 9>&-
 }
 
 cmd_reveal() {
@@ -379,6 +499,7 @@ status) cmd_status ;;
 pick) cmd_pick ;;
 start) shift; cmd_start "$@" ;;
 stop) cmd_stop ;;
+render) shift; cmd_render "$@" ;;
 reveal) shift; cmd_reveal "$@" ;;
-*) fail "usage" "Usage: creator-mode-rec check|status|pick|start [--audio=none|desktop|desktop+mic] [--target=focused|monitor:NAME|region:WxH+X+Y]|stop|reveal <file>" ;;
+*) fail "usage" "Usage: creator-mode-rec check|status|pick|start [--audio=none|desktop|desktop+mic] [--target=focused|monitor:NAME|region:WxH+X+Y] [--studio=on|off]|stop|render <file> [--background=BG] [--zoom=N]|reveal <file>" ;;
 esac
