@@ -5,7 +5,9 @@
 # steered by FAKE_RECORDER_MODE: ok | exit-early | never-write | ignore-int.
 
 if [[ ${1:-} == "--help" ]]; then
-  echo "  -cursor  Record cursor. Optional, set to 'yes' by default."
+  # Same shape as gpu-screen-recorder 6.x: the flag only appears inside [...]
+  # on the usage line.
+  echo "usage: gpu-screen-recorder -w <window_id|monitor|focused|portal> [-f <fps>] [-cursor yes|no] [-o <output_file>]"
   exit 0
 fi
 [[ -n ${FAKE_RECORDER_ARGS:-} ]] && printf '%s\n' "$@" >"$FAKE_RECORDER_ARGS"

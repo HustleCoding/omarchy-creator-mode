@@ -203,7 +203,9 @@ logical_region() {
 }
 
 recorder_can_hide_cursor() {
-  "$RECORDER" --help 2>&1 | grep -qE -- '(^|[[:space:]])-cursor([[:space:]]|$)'
+  # gpu-screen-recorder lists it as "-cursor ..." in older help text and as
+  # "[-cursor yes|no]" in the 6.x usage line.
+  "$RECORDER" --help 2>&1 | grep -qE -- '(^|[[:space:][])-cursor([[:space:]]|$)'
 }
 
 foreign_recorder_running() {
