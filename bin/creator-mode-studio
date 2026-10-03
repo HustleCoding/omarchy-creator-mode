@@ -4,11 +4,17 @@
     creator-mode-studio render VIDEO [options]
 
 What it does (all local, ffmpeg + Python standard library only):
-  * auto-zoom: eases in on clicks (or on where the cursor comes to rest when
-    clicks weren't readable), follows the cursor while zoomed, eases back out
-  * smooth cursor: redraws the cursor from the logged path with spring
-    smoothing (the recording itself is captured without a cursor)
-  * click rings, a padded background, rounded corners and a soft shadow
+  * auto-zoom: eases in on clicks, typing bursts, or where the cursor comes to
+    rest when clicks weren't readable; pans only when the cursor leaves a
+    dead zone; eases back out
+  * smooth cursor: redraws the cursor from the logged path with jitter
+    removal and spring smoothing, fades it out while idle, squishes it on
+    clicks and draws an expanding click ring
+  * motion blur on fast cursor moves and fast camera moves
+  * a padded background (Omarchy theme, blurred wallpaper, presets, colors or
+    an image) with rounded corners, an optional inset border and a soft shadow
+  * export presets: source, 16:9, 9:16, 1:1, 4:5; MP4 or GIF; preview quality;
+    VAAPI hardware encoding when the GPU supports it
 
 Cursor/click data comes from the events file written by creator-mode-track
 (default: <video dir>/.creator-mode/<video name>.events.jsonl). Without it the
@@ -20,6 +26,7 @@ Failures print {"ok":false,"error":...,"message":...} and exit non-zero.
 """
 
 import argparse
+import glob
 import json
 import math
 import os
@@ -37,22 +44,50 @@ PRESETS = {
     "sunset": ("#fb923c", "#be185d"),
     "ocean": ("#38bdf8", "#4338ca"),
     "forest": ("#34d399", "#064e3b"),
+    "aurora": ("#22d3ee", "#7c3aed"),
+    "candy": ("#f9a8d4", "#8b5cf6"),
+    "peach": ("#fed7aa", "#f43f5e"),
+    "dusk": ("#a78bfa", "#1e1b4b"),
+    "lime": ("#d9f99d", "#0f766e"),
+    "slate": ("#94a3b8", "#0f172a"),
     "mono": ("#3f3f46", "#09090b"),
 }
+FORMATS = {"16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:5": (4, 5)}
 THEME_COLORS = os.path.expanduser("~/.local/state/omarchy/current/theme/colors.toml")
+WALLPAPER = os.path.expanduser("~/.local/state/omarchy/current/background")
 
-# Timing of the automatic zoom, in seconds.
-ZOOM_LEAD = 0.35       # start easing in this long before a click
+# Automatic zoom timing, in seconds.
+ZOOM_LEAD = 0.45       # start easing in this long before a click
 ZOOM_HOLD = 1.8        # stay zoomed this long after the last click
-KEY_HOLD = 1.2         # typing keeps an existing zoom alive this long
-MERGE_GAP = 1.2        # clicks closer than hold + this share one zoom
+ZOOM_IN = 0.75         # ease-in duration
+ZOOM_OUT = 0.95        # ease-out duration
+KEY_HOLD = 1.4         # typing keeps a zoom alive this long after the last key
+TYPE_GAP = 1.0         # keys closer than this are one typing burst
+TYPE_MIN = 3           # keys in a burst before it counts as typing
+MERGE_GAP = 1.2        # focus points closer than hold + this share one zoom
 DWELL_MOVE = 80        # logical px the cursor must travel before a rest counts
 DWELL_STILL = 6        # logical px of jitter allowed while resting
 DWELL_TIME = 0.45      # rest this long to count as a focus point
-DEADZONE = 0.30        # while zoomed, re-center once the cursor leaves this inner fraction
-CLICK_RING_TIME = 0.22
+DEADZONE = 0.35        # while zoomed, pan only once the cursor leaves the inner (1 - this) of the view
+PAN_STIFFNESS = 14.0   # camera pan spring (critically damped)
+
+# Cursor.
+JITTER = 1.5           # logical px of movement ignored as sensor noise
+IDLE_FADE_OUT = 0.35
+IDLE_FADE_IN = 0.12
+PRESS_DOWN = 0.06      # click squish: time to press down
+PRESS_UP = 0.18        # and to spring back
+PRESS_SCALE = 0.82
+RING_TIME = 0.45
+SCALES = (1.0, 0.955, 0.91, 0.865, 0.82)
+ALPHAS = 11            # alpha levels in the cursor sprite sheet (0, 0.1, ... 1)
+RING_FRAMES = 9
+BLUR_START = 9.0       # cursor speed (logical px per 60 Hz frame) where the blur trail starts
+BLUR_FULL = 26.0       # and where it is strongest
+CAMERA_BLUR_SPEED = 3.5  # camera speed (output px per frame at 1080p) that turns on motion blur
 
 JSON_MODE = False
+OFF = -10000
 
 
 class RenderError(Exception):
@@ -70,6 +105,24 @@ def emit(obj):
 def log(msg):
     if not JSON_MODE:
         print(msg, file=sys.stderr, flush=True)
+
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def ease_in_out(p):
+    p = clamp(p, 0.0, 1.0)
+    return 4 * p * p * p if p < 0.5 else 1 - (-2 * p + 2) ** 3 / 2
+
+
+def ease_out(p):
+    p = clamp(p, 0.0, 1.0)
+    return 1 - (1 - p) ** 3
+
+
+def even(v):
+    return max(2, int(round(v)) // 2 * 2)
 
 
 # ------------------------------------------------------------------ probing
@@ -100,15 +153,38 @@ def probe(video):
     }
 
 
-def ffmpeg_script_flag():
+def ffmpeg_version():
     try:
         out = subprocess.run(["ffmpeg", "-hide_banner", "-version"], capture_output=True, text=True).stdout
     except OSError:
         raise RenderError("missing_dependency", "Missing: ffmpeg. Install with: sudo pacman -S ffmpeg") from None
     m = re.search(r"ffmpeg version n?(\d+)\.(\d+)", out)
-    if m and (int(m.group(1)), int(m.group(2))) < (7, 1):
-        return "-filter_complex_script"
-    return "-/filter_complex"
+    return (int(m.group(1)), int(m.group(2))) if m else (99, 0)
+
+
+def ffmpeg_script_flag():
+    return "-filter_complex_script" if ffmpeg_version() < (7, 1) else "-/filter_complex"
+
+
+def vaapi_device():
+    dev = os.environ.get("CREATOR_MODE_VAAPI_DEVICE")
+    if dev:
+        return dev if os.path.exists(dev) else None
+    nodes = sorted(glob.glob("/dev/dri/renderD*"))
+    return nodes[0] if nodes else None
+
+
+def vaapi_works(dev):
+    """A tiny real encode: listing h264_vaapi says nothing about the driver."""
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-vaapi_device", dev,
+             "-f", "lavfi", "-i", "color=black:s=256x256:r=30:d=0.2",
+             "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
 
 
 # ------------------------------------------------------------------ events
@@ -139,7 +215,8 @@ def load_events(path):
                 moves.append((float(ev["t"]), float(ev["x"]), float(ev["y"])))
     if not meta or "region" not in meta:
         raise RenderError("bad_events", f"{path} has no header line")
-    return meta, moves, clicks, keys, end
+    moves.sort()
+    return meta, moves, sorted(clicks), sorted(keys), end
 
 
 # ------------------------------------------------------------------ motion
@@ -154,27 +231,60 @@ class Spring:
         self.c = 2.0 * math.sqrt(stiffness) * ratio
 
     def step(self, target, dt):
-        accel = self.k * (target - self.value) - self.c * self.velocity
-        self.velocity += accel * dt
-        self.value += self.velocity * dt
+        # sub-step so stiff springs stay stable at low frame rates
+        n = max(1, int(math.ceil(dt * math.sqrt(self.k) / 0.25)))
+        h = dt / n
+        for _ in range(n):
+            accel = self.k * (target - self.value) - self.c * self.velocity
+            self.velocity += accel * h
+            self.value += self.velocity * h
         return self.value
 
 
 def sample_cursor(moves, n_frames, fps, offset, map_xy):
-    """Cursor position (video px, or None before the first sample) at each frame."""
+    """Cursor position (work px, or None before the first sample) at each frame.
+    The tracker logs only changes, so short gaps are interpolated and long gaps hold."""
     out = [None] * n_frames
-    i, current = 0, None
+    i = 0
     for n in range(n_frames):
         t = n / fps + offset
-        while i < len(moves) and moves[i][0] <= t:
-            current = map_xy(moves[i][1], moves[i][2])
+        if not moves or moves[0][0] > t:
+            continue
+        while i + 1 < len(moves) and moves[i + 1][0] <= t:
             i += 1
-        out[n] = current
+        t0, x0, y0 = moves[i]
+        if i + 1 < len(moves) and 0 < moves[i + 1][0] - t0 < 0.1:
+            t1, x1, y1 = moves[i + 1]
+            a = (t - t0) / (t1 - t0)
+            x0, y0 = x0 + (x1 - x0) * a, y0 + (y1 - y0) * a
+        out[n] = map_xy(x0, y0)
+    return out
+
+
+def smooth_cursor(raw, fps, smoothing, jitter):
+    """Deadband against sensor jitter, then a critically damped spring."""
+    stiffness = 1400.0 * (1 - smoothing) + 90.0 * smoothing
+    sx = sy = None
+    held = None
+    out = []
+    dt = 1.0 / fps
+    for pos in raw:
+        if pos is None:
+            out.append(None)
+            continue
+        if held is None or math.hypot(pos[0] - held[0], pos[1] - held[1]) > jitter:
+            held = pos
+        if sx is None:
+            sx, sy = Spring(pos[0], stiffness), Spring(pos[1], stiffness)
+        if smoothing <= 0:
+            out.append(held)
+        else:
+            out.append((sx.step(held[0], dt), sy.step(held[1], dt)))
     return out
 
 
 def dwell_points(cursor, fps, scale):
-    """Frames where the cursor comes to rest after travelling (click stand-in)."""
+    """Times where the cursor comes to rest after travelling (click stand-in)."""
     points, anchor, still_since, travelled, last_point = [], None, None, 0.0, -1e9
     move_px, still_px, still_frames = DWELL_MOVE * scale, DWELL_STILL * scale, int(DWELL_TIME * fps)
     prev = None
@@ -194,55 +304,152 @@ def dwell_points(cursor, fps, scale):
     return points
 
 
-def zoom_segments(focus_times, key_times, duration):
+def typing_bursts(key_times):
+    bursts, cur = [], []
+    for k in key_times:
+        if cur and k - cur[-1] > TYPE_GAP:
+            if len(cur) >= TYPE_MIN:
+                bursts.append((cur[0], cur[-1]))
+            cur = []
+        cur.append(k)
+    if len(cur) >= TYPE_MIN:
+        bursts.append((cur[0], cur[-1]))
+    return bursts
+
+
+def position_at(cursor, t, fps):
+    n = clamp(int(round(t * fps)), 0, len(cursor) - 1)
+    for m in range(n, -1, -1):
+        if cursor[m] is not None:
+            return cursor[m]
+    return next((p for p in cursor[n:] if p is not None), None)
+
+
+def zoom_segments(focus_times, key_times, duration, cursor, fps, zoom):
+    """Zoom segments: {"start", "end", "zoom", "focus": [(t, x, y), ...]}.
+
+    A focus point is a click (or a cursor rest); typing extends the zoom it
+    happens in, and a typing burst outside any zoom starts one on the last
+    click, so the camera stays on the text field being typed into."""
+    points = []
+    for t in focus_times:
+        p = position_at(cursor, t, fps)
+        if p is not None:
+            points.append((t, p[0], p[1], t + ZOOM_HOLD))
+    for start, stop in typing_bursts(key_times):
+        if any(t - ZOOM_LEAD <= start <= hold + MERGE_GAP for t, _, _, hold in points):
+            continue
+        prior = [pt for pt in points if pt[0] <= start and start - pt[0] < 15]
+        p = prior[-1][1:3] if prior else position_at(cursor, start, fps)
+        if p is not None:
+            points.append((start, p[0], p[1], stop + KEY_HOLD))
+    points.sort()
     segs = []
-    for t in sorted(focus_times):
-        start, hold = max(0.0, t - ZOOM_LEAD), t + ZOOM_HOLD
-        if segs and start <= segs[-1][1] + MERGE_GAP:
-            segs[-1][1] = max(segs[-1][1], hold)
-            segs[-1][2].append(t)
+    for t, x, y, hold in points:
+        start = max(0.0, t - ZOOM_LEAD)
+        if segs and start <= segs[-1]["end"] + MERGE_GAP:
+            segs[-1]["end"] = max(segs[-1]["end"], hold)
+            segs[-1]["focus"].append((t, x, y))
         else:
-            segs.append([start, hold, [t]])
+            segs.append({"start": start, "end": hold, "zoom": zoom, "focus": [(t, x, y)]})
     for k in key_times:
         for seg in segs:
-            if seg[0] <= k <= seg[1]:
-                seg[1] = max(seg[1], k + KEY_HOLD)
-    return [(s, min(h, duration), ts) for s, h, ts in segs]
+            if seg["start"] <= k <= seg["end"]:
+                seg["end"] = max(seg["end"], k + KEY_HOLD)
+    out = []
+    for seg in segs:
+        seg["end"] = min(seg["end"], duration)
+        if out and seg["start"] <= out[-1]["end"]:
+            out[-1]["end"] = max(out[-1]["end"], seg["end"])
+            out[-1]["focus"] += seg["focus"]
+        elif seg["end"] > seg["start"]:
+            out.append(seg)
+    return out
 
 
-def camera_path(cursor, n_frames, fps, w, h, segments, zoom):
-    """Per-frame (zoom, center_x, center_y)."""
+def zoom_amount(t, seg):
+    """0..1: how far into seg's zoom the camera is at time t."""
+    rise = ease_in_out((t - seg["start"]) / ZOOM_IN)
+    fall = 1 - ease_in_out((t - seg["end"]) / ZOOM_OUT)
+    return min(rise, fall)
+
+
+def camera_path(cursor, n_frames, fps, w, h, view, segments, fill):
+    """Per-frame viewport (left, top, width, height) in work px.
+
+    view = (vw0, vh0): the viewport at zoom 1 (the whole frame, or a slice of
+    it when the output aspect differs and --layout fill is used)."""
     dt = 1.0 / fps
-    z_spring = Spring(1.0, 34.0)
-    cx_spring, cy_spring = Spring(w / 2, 22.0), Spring(h / 2, 22.0)
-    seg_i, target = 0, (w / 2, h / 2)
+    vw0, vh0 = view
+    mid = (w / 2, h / 2)
+    base_x, base_y = Spring(mid[0], 6.0), Spring(mid[1], 6.0)
+    base_target = list(mid)
+    pan_x, pan_y = Spring(mid[0], PAN_STIFFNESS), Spring(mid[1], PAN_STIFFNESS)
+    target = mid
+    seg_i, entered = 0, -1
     out = []
     for n in range(n_frames):
         t = n * dt
-        while seg_i < len(segments) and t > segments[seg_i][1]:
-            seg_i += 1
-        active = seg_i < len(segments) and segments[seg_i][0] <= t <= segments[seg_i][1]
         pos = cursor[n]
-        if active:
-            seg = segments[seg_i]
-            if abs(t - seg[0]) < dt:
-                first = int(min(seg[2][0], (n_frames - 1) / fps) * fps)
-                target = cursor[first] or pos or target
-            elif pos is not None:
-                hw, hh = w / (2 * zoom), h / (2 * zoom)
-                if abs(pos[0] - target[0]) > hw * (1 - DEADZONE) or abs(pos[1] - target[1]) > hh * (1 - DEADZONE):
-                    target = pos
-            z_target = zoom
-        else:
-            target = (w / 2, h / 2)
-            z_target = 1.0
-        z = max(1.0, z_spring.step(z_target, dt))
-        cx, cy = cx_spring.step(target[0], dt), cy_spring.step(target[1], dt)
-        hw, hh = w / (2 * z), h / (2 * z)
-        cx = min(max(cx, hw), w - hw)
-        cy = min(max(cy, hh), h - hh)
-        out.append((z, cx, cy))
+        # the base viewport (zoom 1) follows the cursor when it is narrower than the frame
+        if fill and pos is not None:
+            for axis, size, full in ((0, vw0, w), (1, vh0, h)):
+                if size < full - 1 and abs(pos[axis] - base_target[axis]) > size / 2 * 0.5:
+                    base_target[axis] = pos[axis]
+        bx, by = base_x.step(base_target[0], dt), base_y.step(base_target[1], dt)
+
+        while seg_i + 1 < len(segments) and t >= segments[seg_i + 1]["start"]:
+            seg_i += 1
+        seg = segments[seg_i] if segments else None
+        amount = zoom_amount(t, seg) if seg and t >= seg["start"] else 0.0
+        z = 1.0 + (seg["zoom"] - 1.0) * amount if seg else 1.0
+        if seg and seg["start"] <= t <= seg["end"]:
+            if entered != seg_i:
+                entered = seg_i
+                target = seg["focus"][0][1:3]
+                pan_x.value, pan_y.value = target
+                pan_x.velocity = pan_y.velocity = 0.0
+            hw, hh = vw0 / (2 * seg["zoom"]), vh0 / (2 * seg["zoom"])
+            for ft, fx, fy in seg["focus"]:
+                if 0 <= t - ft < dt and (abs(fx - target[0]) > hw * (1 - DEADZONE) or abs(fy - target[1]) > hh * (1 - DEADZONE)):
+                    target = (fx, fy)
+            if pos is not None and (abs(pos[0] - target[0]) > hw * (1 - DEADZONE) or abs(pos[1] - target[1]) > hh * (1 - DEADZONE)):
+                target = (target[0] + (pos[0] - target[0]) * 0.85, target[1] + (pos[1] - target[1]) * 0.85)
+        px, py = pan_x.step(target[0], dt), pan_y.step(target[1], dt)
+        # blend from the base view to the pan target as the zoom comes in, so
+        # zooming reads as one move toward the point rather than zoom-then-pan
+        s = (z - 1.0) / (seg["zoom"] - 1.0) if seg and seg["zoom"] > 1.0 else 0.0
+        cx, cy = bx + (px - bx) * s, by + (py - by) * s
+        vw, vh = vw0 / z, vh0 / z
+        cx = clamp(cx, vw / 2, w - vw / 2)
+        cy = clamp(cy, vh / 2, h - vh / 2)
+        out.append((cx - vw / 2, cy - vh / 2, vw, vh))
     return out
+
+
+def blur_windows(camera, fps, out_w, canvas_h):
+    """Time ranges where the camera moves fast enough to deserve motion blur."""
+    flags = []
+    norm = 1080.0 / canvas_h * (fps / 60.0)
+    for n in range(len(camera)):
+        if n == 0:
+            flags.append(False)
+            continue
+        (l0, t0, w0, h0), (l1, t1, w1, h1) = camera[n - 1], camera[n]
+        k = out_w / w1
+        move = max(abs(l1 - l0), abs(t1 - t0), abs(l1 + w1 - l0 - w0), abs(t1 + h1 - t0 - h0)) * k * norm
+        flags.append(move > CAMERA_BLUR_SPEED)
+    windows, start = [], None
+    for n, f in enumerate(flags + [False]):
+        if f and start is None:
+            start = n
+        elif not f and start is not None:
+            if windows and start - windows[-1][1] <= 3:
+                windows[-1] = (windows[-1][0], n)
+            else:
+                windows.append((start, n))
+            start = None
+    return [(max(0, a - 1) / fps, (b + 1) / fps) for a, b in windows if b - a >= 2]
 
 
 def piecewise_expr(values, step):
@@ -306,19 +513,22 @@ ARROW_OUTER = [(0, 0), (0, 22.4), (5.4, 17.1), (9.0, 25.2), (12.9, 23.5), (9.4, 
 ARROW_INNER = [(1.6, 3.8), (1.6, 18.6), (5.9, 14.4), (9.8, 23.0), (11.0, 22.5), (7.1, 13.9), (12.9, 13.9)]
 
 
-def make_cursor(path, size_px):
-    """Black arrow, white outline, soft drop shadow. Returns (w, h, hotspot_x, hotspot_y)."""
-    unit = size_px / 25.2
-    pad = max(2, int(round(3 * unit)))
-    w = int(math.ceil(17 * unit)) + pad * 2
-    h = int(math.ceil(25.5 * unit)) + pad * 2
+def cursor_tile(w, h, pad, unit):
+    """RGBA (premultiplied-free) pixels of the arrow at `unit` px per design unit,
+    tip at (pad, pad): black body, white outline, soft drop shadow."""
     ss = 3
-    cover_outer = [0.0] * (w * h)
-    cover_inner = [0.0] * (w * h)
     outer = [(x * unit + pad, y * unit + pad) for x, y in ARROW_OUTER]
     inner = [(x * unit + pad, y * unit + pad) for x, y in ARROW_INNER]
+    cover_o = [0.0] * (w * h)
+    cover_i = [0.0] * (w * h)
+    x_max = 17 * unit + pad + 1
+    y_max = 25.5 * unit + pad + 1
     for py in range(h):
+        if py > y_max:
+            break
         for px in range(w):
+            if px > x_max:
+                break
             o = i = 0
             for sy in range(ss):
                 for sx in range(ss):
@@ -327,46 +537,178 @@ def make_cursor(path, size_px):
                         o += 1
                         if inside(inner, x, y):
                             i += 1
-            cover_outer[py * w + px] = o / (ss * ss)
-            cover_inner[py * w + px] = i / (ss * ss)
-    # shadow: outer coverage shifted down/right and box-blurred
+            cover_o[py * w + px] = o / (ss * ss)
+            cover_i[py * w + px] = i / (ss * ss)
     shift = max(1, int(round(1.2 * unit)))
-    radius = max(1, int(round(1.5 * unit)))
-    shadow = [0.0] * (w * h)
+    radius = max(1, int(round(1.6 * unit)))
+    # separable box blur of the shifted outline coverage
+    tmp = [0.0] * (w * h)
     for py in range(h):
         for px in range(w):
-            acc = cnt = 0
+            acc = 0.0
+            for dx in range(-radius, radius + 1):
+                x = px - shift + dx
+                if 0 <= x < w:
+                    acc += cover_o[py * w + x]
+            tmp[py * w + px] = acc
+    shadow = [0.0] * (w * h)
+    norm = (2 * radius + 1) ** 2
+    for py in range(h):
+        for px in range(w):
+            acc = 0.0
             for dy in range(-radius, radius + 1):
-                for dx in range(-radius, radius + 1):
-                    x, y = px - shift + dx, py - shift + dy
-                    if 0 <= x < w and 0 <= y < h:
-                        acc += cover_outer[y * w + x]
-                    cnt += 1
-            shadow[py * w + px] = acc / cnt * 0.45
-    rgba = bytearray(w * h * 4)
+                y = py - shift + dy
+                if 0 <= y < h:
+                    acc += tmp[y * w + px]
+            shadow[py * w + px] = acc / norm * 0.45
+    px_out = []
     for k in range(w * h):
-        o, i, s = cover_outer[k], cover_inner[k], shadow[k]
-        # white outline over shadow, black body over outline
+        o, i, s = cover_o[k], cover_i[k], shadow[k]
         a = o + s * (1 - o)
-        white = o - i
-        c = (255 * white) / a if a > 0 else 0
-        rgba[k * 4:k * 4 + 4] = bytes((int(c), int(c), int(c), int(round(a * 255))))
-    write_png(path, w, h, rgba)
-    return w, h, pad, pad
+        c = 255 * (o - i) / a if a > 0 else 0
+        px_out.append((int(c), a))
+    return px_out
 
 
-def make_ring(path, radius_px, width_px):
+def make_cursor_sheet(path, size_px):
+    """Sprite sheet: rows are press scales (SCALES), columns alpha levels.
+    Returns (tile_w, tile_h, hotspot) — the hotspot is the same in every tile."""
+    unit = size_px / 25.2
+    pad = max(2, int(round(3 * unit)))
+    tw = int(math.ceil(17 * unit)) + pad * 2 + 2
+    th = int(math.ceil(25.5 * unit)) + pad * 2 + 2
+    sw, sh = tw * ALPHAS, th * len(SCALES)
+    rgba = bytearray(sw * sh * 4)
+    for row, scale in enumerate(SCALES):
+        tile = cursor_tile(tw, th, pad, unit * scale)
+        for col in range(ALPHAS):
+            alpha = col / (ALPHAS - 1)
+            for y in range(th):
+                base = ((row * th + y) * sw + col * tw) * 4
+                for x in range(tw):
+                    c, a = tile[y * tw + x]
+                    k = base + x * 4
+                    rgba[k:k + 4] = bytes((c, c, c, int(round(a * alpha * 255))))
+    write_png(path, sw, sh, rgba)
+    return tw, th, pad
+
+
+def make_ring_sheet(path, radius_px, width_px):
+    """RING_FRAMES tiles of an expanding, fading click ring."""
     size = int(math.ceil((radius_px + width_px) * 2)) + 4
     c = size / 2
-    rgba = bytearray(size * size * 4)
-    for y in range(size):
-        for x in range(size):
-            d = abs(math.hypot(x + 0.5 - c, y + 0.5 - c) - radius_px)
-            a = min(1.0, max(0.0, width_px / 2 + 0.5 - d))
-            k = (y * size + x) * 4
-            rgba[k:k + 4] = bytes((255, 255, 255, int(a * 170)))
-    write_png(path, size, size, rgba)
+    sw = size * RING_FRAMES
+    rgba = bytearray(sw * size * 4)
+    for f in range(RING_FRAMES):
+        p = f / (RING_FRAMES - 1)
+        r = radius_px * (0.35 + 0.65 * ease_out(p))
+        lw = width_px * (1.3 - 0.5 * p)
+        fade = (1 - p) ** 1.3
+        for y in range(size):
+            for x in range(size):
+                d = math.hypot(x + 0.5 - c, y + 0.5 - c)
+                ring = clamp(lw / 2 + 0.5 - abs(d - r), 0.0, 1.0)
+                fill = clamp(r - d, 0.0, 1.0) * 0.22
+                a = max(ring * 0.8, fill) * fade
+                k = (y * sw + f * size + x) * 4
+                rgba[k:k + 4] = bytes((255, 255, 255, int(a * 255)))
+    write_png(path, sw, size, rgba)
     return size
+
+
+def cursor_track(smooth, raw, clicks_f, fps, w, h, scale, hide_idle, blur):
+    """Per-frame sprite states for the cursor, two blur ghosts and the ring:
+    [(tile_col, tile_row, x, y) or None, ...] per layer."""
+    n_frames = len(smooth)
+    alpha, last_move, anchor = 0.0, -1e9, None
+    press_i = ring_i = 0
+    main, g1, g2, ring = [], [], [], []
+    last_click = None
+    for n in range(n_frames):
+        pos, rpos = smooth[n], raw[n]
+        while press_i < len(clicks_f) and clicks_f[press_i] <= n:
+            last_click = clicks_f[press_i]
+            last_move = n
+            press_i += 1
+        if rpos is not None and (anchor is None or math.hypot(rpos[0] - anchor[0], rpos[1] - anchor[1]) > 3 * scale):
+            anchor = rpos
+            last_move = n
+        visible = pos is not None and -2 <= pos[0] <= w + 2 and -2 <= pos[1] <= h + 2
+        idle = (n - last_move) / fps
+        want = 1.0 if visible and (hide_idle <= 0 or idle < hide_idle) else 0.0
+        if n == 0:
+            alpha = want
+        elif want > alpha:
+            alpha = min(want, alpha + 1.0 / (IDLE_FADE_IN * fps))
+        else:
+            alpha = max(want, alpha - 1.0 / (IDLE_FADE_OUT * fps))
+        if not visible:
+            alpha = 0.0
+        squish = 1.0
+        if last_click is not None:
+            d = (n - last_click) / fps
+            if d < PRESS_DOWN:
+                squish = 1 - (1 - PRESS_SCALE) * ease_out(d / PRESS_DOWN)
+            elif d < PRESS_DOWN + PRESS_UP:
+                squish = PRESS_SCALE + (1 - PRESS_SCALE) * ease_out((d - PRESS_DOWN) / PRESS_UP)
+        row = min(range(len(SCALES)), key=lambda i: abs(SCALES[i] - squish))
+        col = int(round(alpha * (ALPHAS - 1)))
+        main.append((col, row, pos[0], pos[1]) if col > 0 and pos is not None else None)
+
+        ghosts = [None, None]
+        if blur and col > 0 and n > 0 and smooth[n - 1] is not None:
+            prev = smooth[n - 1]
+            speed = math.hypot(pos[0] - prev[0], pos[1] - prev[1]) / scale * (fps / 60.0)
+            k = clamp((speed - BLUR_START) / (BLUR_FULL - BLUR_START), 0.0, 1.0)
+            if k > 0:
+                for gi, (frac, strength) in enumerate(((0.33, 0.55), (0.66, 0.3))):
+                    gcol = int(round(alpha * strength * k * (ALPHAS - 1)))
+                    if gcol > 0:
+                        ghosts[gi] = (gcol, row, pos[0] - (pos[0] - prev[0]) * frac, pos[1] - (pos[1] - prev[1]) * frac)
+        g1.append(ghosts[0])
+        g2.append(ghosts[1])
+
+        state = None
+        while ring_i < len(clicks_f) and clicks_f[ring_i] <= n:
+            ring_i += 1
+        if ring_i:
+            d = (n - clicks_f[ring_i - 1]) / fps
+            frame = int(d / RING_TIME * (RING_FRAMES - 1))
+            if 0 <= d < RING_TIME and frame < RING_FRAMES - 1:
+                at = raw[clicks_f[ring_i - 1]] if clicks_f[ring_i - 1] < n_frames else None
+                at = at or pos
+                if at is not None:
+                    state = (frame, 0, at[0], at[1])
+        ring.append(state)
+    return main, g1, g2, ring
+
+
+def sprite_commands(layers, fps):
+    """sendcmd scripts: one for the sprite crops (tile choice), one for the
+    overlays (position). layers: [(name, states, tile_w, tile_h, anchor_x, anchor_y)]."""
+    crop_lines, pos_lines = [], []
+    n_frames = len(layers[0][1])
+    last = {}
+    for n in range(n_frames):
+        crop_cmds, pos_cmds = [], []
+        for name, states, tw, th, ax, ay in layers:
+            st = states[n]
+            if st is None:
+                tile, xy = last.get(name, (None, None))[0], (OFF, OFF)
+            else:
+                tile, xy = (st[0] * tw, st[1] * th), (int(round(st[2] - ax)), int(round(st[3] - ay)))
+            prev_tile, prev_xy = last.get(name, (None, None))
+            if tile is not None and tile != prev_tile:
+                crop_cmds += [f"crop@{name} x {tile[0]}", f"crop@{name} y {tile[1]}"]
+            if xy != prev_xy:
+                pos_cmds += [f"overlay@{name} x {xy[0]}", f"overlay@{name} y {xy[1]}"]
+            last[name] = (tile if tile is not None else prev_tile, xy)
+        ts = f"{n / fps:.4f}"
+        if crop_cmds:
+            crop_lines.append(ts + " " + ", ".join(crop_cmds) + ";")
+        if pos_cmds:
+            pos_lines.append(ts + " " + ", ".join(pos_cmds) + ";")
+    return crop_lines, pos_lines
 
 
 def theme_gradient():
@@ -411,29 +753,55 @@ def run_ffmpeg(args, what):
         raise RenderError("ffmpeg_failed", f"ffmpeg failed while {what}: {proc.stderr.strip()[-400:]}")
 
 
-def make_backdrop(path, cw, ch, box, radius, spec):
-    """Background (gradient or image) with the shadow of the video card baked in."""
-    x, y, bw, bh = box
-    hw_small = 2  # render at half size; both layers are smooth
-    sw, sh = max(2, cw // hw_small), max(2, ch // hw_small)
-    k = sw / cw
-    colors = background_colors(spec)
+def make_backdrop(path, cw, ch, card, radius, spec, blur, shadow, inset, inset_color):
+    """Background with the card's shadow (and inset border fill) baked in."""
+    x, y, bw, bh = card
+    colors = None
+    image = None
+    if spec == "wallpaper":
+        image = os.path.realpath(WALLPAPER)
+        if not os.path.isfile(image):
+            raise RenderError("usage", "No Omarchy wallpaper found (~/.local/state/omarchy/current/background)")
+        if blur is None:
+            blur = 28
+    elif os.path.isfile(spec):
+        image = spec
+    else:
+        colors = background_colors(spec)
+        if not colors:
+            raise RenderError("usage", f"Unknown background: {spec} (use theme, wallpaper, {', '.join(PRESETS)}, "
+                                       "#rrggbb[:#rrggbb] or an image path)")
     if colors:
         (r1, g1, b1), (r2, g2, b2) = parse_hex(colors[0]), parse_hex(colors[1])
         t = "((X/W)*0.45+(Y/H)*0.55)"
-        bg = (f"geq=r='{r1}+({r2 - r1})*{t}':g='{g1}+({g2 - g1})*{t}':b='{b1}+({b2 - b1})*{t}'")
-        bg_input = ["-f", "lavfi", "-i", f"color=black:s={sw}x{sh}:d=1,format=rgb24"]
-    elif os.path.isfile(spec):
-        bg = f"scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh},format=rgb24"
-        bg_input = ["-i", spec]
+        bg = f"geq=r='{r1}+({r2 - r1})*{t}':g='{g1}+({g2 - g1})*{t}':b='{b1}+({b2 - b1})*{t}'"
+        bg_input = ["-f", "lavfi", "-i", f"color=black:s={cw}x{ch}:d=1,format=rgb24"]
     else:
-        raise RenderError("usage", f"Unknown background: {spec} (use theme, {', '.join(PRESETS)}, #rrggbb[:#rrggbb] or an image path)")
-    sigma = 0.03 * ch * k
-    sdf = rounded_sdf((x + bw / 2) * k, (y + bh / 2 + 0.014 * ch) * k, bw / 2 * k, bh / 2 * k, radius * k)
-    shadow = f"geq=r=0:g=0:b=0:a='255*0.38*exp(-pow(max({sdf},0)/{sigma:.2f},2))'"
-    run_ffmpeg(bg_input + ["-f", "lavfi", "-i", f"color=black:s={sw}x{sh}:d=1,format=rgba",
-                           "-filter_complex", f"[0:v]{bg}[b];[1:v]{shadow}[s];[b][s]overlay=format=rgb,scale={cw}:{ch}:flags=bicubic,format=rgb24",
-                           "-frames:v", "1", path], "drawing the background")
+        bg = f"scale={cw}:{ch}:force_original_aspect_ratio=increase,crop={cw}:{ch},format=rgb24"
+        if blur:
+            bg += f",gblur=sigma={blur * ch / 1080:.1f}"
+        bg_input = ["-i", image]
+    graph = [f"[0:v]{bg}[b]"]
+    layers = "[b]"
+    inputs = list(bg_input)
+    if shadow > 0:
+        sigma = (0.02 + 0.025 * shadow) * ch
+        sdf = rounded_sdf(x + bw / 2, y + bh / 2 + (0.006 + 0.012 * shadow) * ch, bw / 2, bh / 2, radius)
+        inputs += ["-f", "lavfi", "-i", f"color=black:s={cw}x{ch}:d=1,format=rgba"]
+        graph.append(f"[1:v]geq=r=0:g=0:b=0:a='255*{min(0.9, 0.76 * shadow):.3f}*exp(-pow(max({sdf},0)/{sigma:.2f},2))'[s]")
+        graph.append(f"{layers}[s]overlay=format=rgb[bs]")
+        layers = "[bs]"
+    if inset > 0:
+        r, g, b = parse_hex(inset_color)
+        sdf = rounded_sdf(x + bw / 2, y + bh / 2, bw / 2, bh / 2, radius)
+        idx = len([a for a in inputs if a == "-i"])
+        inputs += ["-f", "lavfi", "-i", f"color=black:s={cw}x{ch}:d=1,format=rgba"]
+        graph.append(f"[{idx}:v]geq=r={r}:g={g}:b={b}:a='255*0.9*clip(0.5-{sdf},0,1)'[i]")
+        graph.append(f"{layers}[i]overlay=format=rgb[bi]")
+        layers = "[bi]"
+    graph.append(f"{layers}format=rgb24[out]")
+    run_ffmpeg(inputs + ["-filter_complex", ";".join(graph), "-map", "[out]", "-frames:v", "1", path],
+               "drawing the background")
 
 
 def make_mask(path, w, h, radius):
@@ -442,10 +810,68 @@ def make_mask(path, w, h, radius):
                 "-vf", f"geq=lum='255*clip(0.5-{sdf},0,1)'", "-frames:v", "1", path], "drawing the rounded mask")
 
 
+# ------------------------------------------------------------------ layout
+
+def canvas_size(fmt, size, w, h):
+    if fmt == "source":
+        if not size:
+            return even(w), even(h)
+        k = size / min(w, h)
+        return even(w * k), even(h * k)
+    a, b = FORMATS[fmt]
+    short = size or 1080
+    return (even(short * a / b), even(short)) if a >= b else (even(short), even(short * b / a))
+
+
+def fit(aspect, avail_w, avail_h):
+    if avail_w / avail_h > aspect:
+        return even(avail_h * aspect), even(avail_h)
+    return even(avail_w), even(avail_w / aspect)
+
+
 # ------------------------------------------------------------------ render
 
-def even(v):
-    return max(2, int(v) // 2 * 2)
+def output_path(video, opts):
+    base = os.path.splitext(video)[0] + "-studio"
+    if opts.format != "source":
+        base += "-" + opts.format.replace(":", "x")
+    if opts.quality == "preview":
+        base += "-preview"
+    return base + (".gif" if opts.export == "gif" else ".mp4")
+
+
+def encode(cmd_head, graph_file, tail_args, tmp_out, duration, progress_span):
+    """Run the main ffmpeg pass, streaming progress; returns stderr on failure."""
+    cmd = cmd_head + [ffmpeg_script_flag(), graph_file] + tail_args + ["-progress", "pipe:1", tmp_out]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    lo, hi = progress_span
+    try:
+        last_pct = -1
+        for line in proc.stdout:
+            key, _, val = line.strip().partition("=")
+            if key == "out_time_us" and val.isdigit():
+                pct = min(99, int((lo + (hi - lo) * min(1.0, int(val) / 1e6 / duration)) * 100))
+                if pct != last_pct:
+                    last_pct = pct
+                    emit({"progress": pct / 100})
+                    if not JSON_MODE:
+                        print(f"\r{pct:3d}%", end="", file=sys.stderr, flush=True)
+        err = proc.stderr.read()
+    except BaseException:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        if os.path.exists(tmp_out):
+            os.remove(tmp_out)
+        raise
+    if proc.wait() != 0:
+        if os.path.exists(tmp_out):
+            os.remove(tmp_out)
+        return err.strip()[-400:] or f"exit {proc.returncode}"
+    return None
 
 
 def render(opts):
@@ -455,17 +881,59 @@ def render(opts):
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             raise RenderError("missing_dependency", f"Missing: {tool}. Install with: sudo pacman -S ffmpeg")
+    if opts.format != "source" and opts.format not in FORMATS:
+        raise RenderError("usage", f"Unknown format: {opts.format} (use source, {', '.join(FORMATS)})")
+    if opts.inset_color and not re.fullmatch(r"#[0-9a-fA-F]{6}", opts.inset_color):
+        raise RenderError("usage", f"--inset-color must be #rrggbb: {opts.inset_color}")
     info = probe(video)
-    w, h, fps, duration = info["w"], info["h"], info["fps"], info["duration"]
+    src_w, src_h, src_fps, duration = info["w"], info["h"], info["fps"], info["duration"]
+    preview = opts.quality == "preview"
+    gif = opts.export == "gif"
+
+    # Work resolution/frame rate: everything (camera, cursor) is computed in this space.
+    fps = min(src_fps, 30.0) if preview else src_fps
+    if gif:
+        fps = min(fps, 30.0)
+    ws = 0.5 if preview and min(src_w, src_h) >= 720 else 1.0
+    w, h = even(src_w * ws), even(src_h * ws)
     n_frames = max(1, int(round(duration * fps)))
 
     events_path = opts.events or default_events_path(video)
     have_events = os.path.isfile(events_path)
-    out = opts.out or os.path.splitext(video)[0] + "-studio.mp4"
-    if os.path.abspath(out) == video:
+    out = os.path.abspath(opts.out or output_path(video, opts))
+    if out == video:
         raise RenderError("usage", "--out must differ from the input video")
 
-    cursor, segments, clicks_v = [None] * n_frames, [], []
+    # Canvas and card geometry.
+    size = opts.size
+    if preview:
+        size = max(360, int((size or min(canvas_size(opts.format, None, src_w, src_h))) / 2))
+    if gif:
+        size = min(size or 720, 720)
+    cw, ch = canvas_size(opts.format, size, src_w, src_h)
+    canvas_aspect = cw / ch
+    src_aspect = w / h
+    layout = opts.layout
+    if layout == "auto":
+        layout = "fill" if opts.format != "source" and abs(math.log(canvas_aspect / src_aspect)) > 0.25 else "fit"
+    video_aspect = canvas_aspect if layout == "fill" else src_aspect
+    pad = clamp(opts.padding, 0.0, 0.3)
+    inset = max(0.0, opts.inset) * ch / 1080 if pad > 0 else 0.0
+    avail_w, avail_h = cw * (1 - 2 * pad) - 2 * inset, ch * (1 - 2 * pad) - 2 * inset
+    vid_w, vid_h = fit(video_aspect, avail_w, avail_h) if pad > 0 else (cw, ch)
+    vid_x, vid_y = (cw - vid_w) // 2, (ch - vid_h) // 2
+    card = (vid_x - inset, vid_y - inset, vid_w + 2 * inset, vid_h + 2 * inset)
+    radius = max(0.0, opts.radius * ch / 1080 if opts.radius is not None else 0.018 * ch) if pad > 0 else 0.0
+    vid_radius = max(0.0, radius - inset * 0.6)
+    if video_aspect >= src_aspect:
+        view = (w, w / video_aspect)
+    else:
+        view = (h * video_aspect, h)
+
+    cursor = [None] * n_frames
+    raw = [None] * n_frames
+    segments, clicks_v = [], []
+    cursor_scale = ws
     if have_events:
         meta, moves, clicks, keys, end = load_events(events_path)
         region = meta["region"]
@@ -477,154 +945,207 @@ def render(opts):
         def map_xy(x, y):
             return (x - region["x"]) * sx, (y - region["y"]) * sy
 
-        cursor = sample_cursor(moves, n_frames, fps, offset, map_xy)
+        raw = sample_cursor(moves, n_frames, fps, offset, map_xy)
+        cursor = smooth_cursor(raw, fps, clamp(opts.smoothing, 0.0, 1.0), JITTER * sx)
         clicks_v = [t - offset for t in clicks if 0 <= t - offset < duration]
         keys_v = [t - offset for t in keys if 0 <= t - offset < duration]
-        focus = clicks_v if (clicks_v or meta.get("input") == "evdev") else dwell_points(cursor, fps, sx)
+        focus = clicks_v if (clicks_v or meta.get("input") == "evdev") else dwell_points(raw, fps, sx)
         if opts.zoom > 1.0:
-            segments = zoom_segments(focus, keys_v, duration)
+            segments = zoom_segments(focus, keys_v, duration, raw, fps, opts.zoom)
         cursor_scale = sx
     else:
         log(f"No events file ({events_path}); framing only.")
-        cursor_scale = 1.0
 
-    camera = camera_path(cursor, n_frames, fps, w, h, segments, max(1.0, opts.zoom))
+    camera = camera_path(cursor, n_frames, fps, w, h, view, segments, layout == "fill")
 
-    # Output canvas keeps the recording's size; the card sits inside the padding.
-    cw, ch = even(w), even(h)
-    pad = max(0.0, min(0.3, opts.padding))
-    iw, ih = even(cw * (1 - 2 * pad)), even(ch * (1 - 2 * pad))
-    ox, oy = (cw - iw) // 2, (ch - ih) // 2
-    radius = max(0.0, opts.radius if opts.radius is not None else 0.018 * ch) if pad > 0 else 0.0
+    encoder = opts.encoder
+    device = None
+    if encoder in ("auto", "vaapi") and not gif:
+        device = vaapi_device()
+        if device and vaapi_works(device):
+            encoder = "vaapi"
+        elif encoder == "vaapi":
+            raise RenderError("vaapi_unavailable", "VAAPI encoding isn't available on this machine (try --encoder x264)")
+        else:
+            encoder = "x264"
+    elif encoder == "auto":
+        encoder = "x264"
 
     work = tempfile.mkdtemp(prefix="creator-mode-studio-", dir=os.environ.get("XDG_RUNTIME_DIR") or None)
     try:
         inputs = ["-i", video]
         graph = []
-        src = "[0:v]"
+        head = "[0:v]"
+        pre = []
+        if abs(fps - src_fps) > 0.01:
+            pre.append(f"fps={fps:g}")
+        if (w, h) != (src_w, src_h):
+            pre.append(f"scale={w}:{h}:flags=bicubic")
+        pre.append("format=yuv420p")
+        src = "[v0]"
         draw_cursor = have_events and not opts.no_cursor and any(p is not None for p in cursor)
+        next_input = 1
 
         if draw_cursor:
-            cursor_png, ring_png = os.path.join(work, "cursor.png"), os.path.join(work, "ring.png")
-            cur_w, cur_h, hot_x, hot_y = make_cursor(cursor_png, 22 * cursor_scale * opts.cursor_scale)
-            ring_size = make_ring(ring_png, 14 * cursor_scale, 3 * cursor_scale)
-            smooth_x = Spring(0.0, 420.0, 0.85)
-            smooth_y = Spring(0.0, 420.0, 0.85)
-            click_frames = sorted(int(t * fps) for t in clicks_v)
-            ci, ring_until, ring_pos = 0, -1, None
-            lines, last = [], None
-            dt = 1.0 / fps
-            started = False
-            for n in range(n_frames):
-                pos = cursor[n]
-                if pos is not None and not started:
-                    smooth_x.value, smooth_y.value = pos
-                    started = True
-                if pos is not None:
-                    px, py = smooth_x.step(pos[0], dt), smooth_y.step(pos[1], dt)
-                    visible = -2 <= pos[0] <= w + 2 and -2 <= pos[1] <= h + 2
-                else:
-                    visible = False
-                while ci < len(click_frames) and click_frames[ci] <= n:
-                    if pos is not None:
-                        ring_until, ring_pos = n + int(CLICK_RING_TIME * fps), (px, py)
-                    ci += 1
-                cx, cy = (int(round(px - hot_x)), int(round(py - hot_y))) if visible else (-10000, -10000)
-                rx, ry = ((int(round(ring_pos[0] - ring_size / 2)), int(round(ring_pos[1] - ring_size / 2)))
-                          if n <= ring_until and ring_pos else (-10000, -10000))
-                state = (cx, cy, rx, ry)
-                if state != last:
-                    cmds = []
-                    if last is None or (cx, cy) != last[:2]:
-                        cmds += [f"overlay@cursor x {cx}", f"overlay@cursor y {cy}"]
-                    if last is None or (rx, ry) != last[2:]:
-                        cmds += [f"overlay@ring x {rx}", f"overlay@ring y {ry}"]
-                    lines.append(f"{n / fps:.4f} " + ", ".join(cmds) + ";")
-                    last = state
-            cmd_file = os.path.join(work, "cursor.cmd")
-            with open(cmd_file, "w") as f:
-                f.write("\n".join(lines) + "\n")
-            inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-i", ring_png,
-                       "-loop", "1", "-framerate", f"{fps:g}", "-i", cursor_png]
-            graph.append(f"{src}sendcmd=f='{cmd_file}'[s0]")
-            graph.append("[s0][1:v]overlay@ring=x=-10000:y=-10000:shortest=1[s1]")
-            graph.append("[s1][2:v]overlay@cursor=x=-10000:y=-10000:shortest=1[s2]")
-            src = "[s2]"
-            next_input = 3
-        else:
-            next_input = 1
+            sheet, ring_png = os.path.join(work, "cursor.png"), os.path.join(work, "ring.png")
+            tw, th, hot = make_cursor_sheet(sheet, 22 * cursor_scale * opts.cursor_scale)
+            ring_size = make_ring_sheet(ring_png, 16 * cursor_scale, 3 * cursor_scale)
+            clicks_f = sorted(int(round(t * fps)) for t in clicks_v)
+            blur = opts.motion_blur and not preview and not gif
+            main, g1, g2, ring = cursor_track(cursor, raw, clicks_f, fps, w, h, cursor_scale,
+                                              opts.hide_idle, blur)
+            layers = [("ring", ring, ring_size, ring_size, ring_size / 2, ring_size / 2),
+                      ("g2", g2, tw, th, hot, hot), ("g1", g1, tw, th, hot, hot),
+                      ("cur", main, tw, th, hot, hot)]
+            layers = [ly for ly in layers if any(s is not None for s in ly[1])]
+            if layers:
+                crop_lines, pos_lines = sprite_commands(layers, fps)
+                crop_cmd, pos_cmd = os.path.join(work, "sprites.cmd"), os.path.join(work, "cursor.cmd")
+                with open(crop_cmd, "w") as f:
+                    f.write("\n".join(crop_lines or ["0.0 crop@none x 0;"]) + "\n")
+                with open(pos_cmd, "w") as f:
+                    f.write("\n".join(pos_lines) + "\n")
+                cursor_layers = [ly for ly in layers if ly[0] != "ring"]
+                if any(ly[0] == "ring" for ly in layers):
+                    inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-i", ring_png]
+                    ring_in = next_input
+                    next_input += 1
+                if cursor_layers:
+                    inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-i", sheet]
+                    sheet_in = next_input
+                    next_input += 1
+                pre.append(f"sendcmd=f='{pos_cmd}'")
+                graph.append(f"{head}{','.join(pre)}[v0]")
+                sprite_streams = {}
+                # one sendcmd reaches every filter in the graph; it sits on a
+                # sprite stream so tile changes land on the matching sprite frame
+                sendc = f"sendcmd=f='{crop_cmd}',"
+                if any(ly[0] == "ring" for ly in layers):
+                    graph.append(f"[{ring_in}:v]{sendc}crop@ring=w={ring_size}:h={ring_size}:x=0:y=0[sp_ring]")
+                    sprite_streams["ring"] = "[sp_ring]"
+                    sendc = ""
+                if cursor_layers:
+                    names = [ly[0] for ly in cursor_layers]
+                    if len(names) > 1:
+                        graph.append(f"[{sheet_in}:v]{sendc}split={len(names)}" + "".join(f"[sh_{n}]" for n in names))
+                    else:
+                        graph.append(f"[{sheet_in}:v]{sendc}null[sh_{names[0]}]")
+                    for name in names:
+                        graph.append(f"[sh_{name}]crop@{name}=w={tw}:h={th}:x=0:y=0[sp_{name}]")
+                        sprite_streams[name] = f"[sp_{name}]"
+                for i, ly in enumerate(layers):
+                    dst = f"[c{i}]"
+                    graph.append(f"{src}{sprite_streams[ly[0]]}overlay@{ly[0]}=x={OFF}:y={OFF}:shortest=1{dst}")
+                    src = dst
+            else:
+                draw_cursor = False
+        if not graph:
+            graph.append(f"{head}{','.join(pre)}[v0]")
 
-        if any(z > 1.0005 for z, _, _ in camera):
+        full = all(abs(l0) < 0.5 and abs(t0) < 0.5 and abs(vw - w) < 0.5 and abs(vh - h) < 0.5
+                   for l0, t0, vw, vh in camera)
+        if not full:
             step = max(1, int(round(fps / 15)))
-            left = [cx - w / (2 * z) for z, cx, cy in camera]
-            top = [cy - h / (2 * z) for z, cx, cy in camera]
-            right = [cx + w / (2 * z) - w for z, cx, cy in camera]
-            bottom = [cy + h / (2 * z) - h for z, cx, cy in camera]
+            left = [c[0] for c in camera]
+            top = [c[1] for c in camera]
+            right = [c[0] + c[2] - w for c in camera]
+            bottom = [c[1] + c[3] - h for c in camera]
             L, T = piecewise_expr(left, step), piecewise_expr(top, step)
             R, B = f"W+{piecewise_expr(right, step)}", f"H+{piecewise_expr(bottom, step)}"
             graph.append(f"{src}perspective=x0='{L}':y0='{T}':x1='{R}':y1='{T}':x2='{L}':y2='{B}':x3='{R}':y3='{B}'"
                          f":interpolation=cubic:eval=frame[z]")
             src = "[z]"
+            windows = blur_windows(camera, fps, vid_w, ch) if opts.motion_blur and not preview and not gif else []
+            if windows:
+                enable = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in windows)
+                graph.append(f"{src}split[za][zb];[zb]tmix=frames=3:weights='1 2 1'[zbl];"
+                             f"[za][zbl]overlay=enable='{enable}':shortest=1[zm]")
+                src = "[zm]"
 
         if pad > 0:
             backdrop, mask = os.path.join(work, "backdrop.png"), os.path.join(work, "mask.png")
-            make_backdrop(backdrop, cw, ch, (ox, oy, iw, ih), radius, opts.background)
-            make_mask(mask, iw, ih, radius)
+            make_backdrop(backdrop, cw, ch, card, radius, opts.background, opts.blur,
+                          clamp(opts.shadow, 0.0, 1.0), inset, opts.inset_color or "#ffffff")
+            make_mask(mask, vid_w, vid_h, vid_radius)
             inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-i", backdrop,
                        "-loop", "1", "-framerate", f"{fps:g}", "-i", mask]
             b, m = next_input, next_input + 1
-            graph.append(f"{src}scale={iw}:{ih}:flags=lanczos,format=yuva420p[c0]")
-            graph.append(f"[{m}:v]format=gray,scale={iw}:{ih}[mk]")
-            graph.append("[c0][mk]alphamerge[c1]")
-            graph.append(f"[{b}:v][c1]overlay={ox}:{oy}:shortest=1:format=auto,format=yuv420p[out]")
+            graph.append(f"{src}scale={vid_w}:{vid_h}:flags=lanczos,format=yuva420p[c0v]")
+            graph.append(f"[{m}:v]format=gray[mk]")
+            graph.append("[c0v][mk]alphamerge[c1v]")
+            graph.append(f"[{b}:v]format=yuv420p[bgv]")
+            graph.append(f"[bgv][c1v]overlay={vid_x}:{vid_y}:shortest=1:format=auto,format=yuv420p[out]")
         else:
-            graph.append(f"{src}scale={cw}:{ch},format=yuv420p[out]")
+            graph.append(f"{src}scale={cw}:{ch}:flags=lanczos,format=yuv420p[out]")
 
         script = os.path.join(work, "graph.txt")
         with open(script, "w") as f:
             f.write(";\n".join(graph))
 
-        tmp_out = os.path.join(os.path.dirname(os.path.abspath(out)), "." + os.path.basename(out) + ".part.mp4")
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-y"] + inputs + [
-            ffmpeg_script_flag(), script, "-map", "[out]"]
-        if info["audio"]:
-            cmd += ["-map", "0:a?", "-c:a", "copy"]
-        cmd += ["-c:v", "libx264", "-preset", opts.preset, "-crf", str(opts.crf), "-pix_fmt", "yuv420p",
-                "-r", f"{fps:g}", "-t", f"{duration:.3f}", "-movflags", "+faststart",
-                "-progress", "pipe:1", tmp_out]
-        log(f"Rendering {os.path.basename(out)} ({len(segments)} zoom{'s' if len(segments) != 1 else ''})…")
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        try:
-            last_pct = -1
-            for line in proc.stdout:
-                key, _, val = line.strip().partition("=")
-                if key == "out_time_us" and val.isdigit():
-                    pct = min(99, int(int(val) / 1e6 / duration * 100))
-                    if pct != last_pct:
-                        last_pct = pct
-                        emit({"progress": pct / 100})
-                        if not JSON_MODE:
-                            print(f"\r{pct:3d}%", end="", file=sys.stderr, flush=True)
-            err = proc.stderr.read()
-        except BaseException:
-            proc.terminate()
+        head_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-y"]
+        tail = ["-map", "[out]"]
+        if info["audio"] and not gif:
+            tail += ["-map", "0:a?", "-c:a", "copy"]
+        tail += ["-r", f"{fps:g}", "-t", f"{duration:.3f}"]
+        if gif:
+            mid = os.path.join(work, "gif-source.mp4")
+            tmp_out = mid
+            tail += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p"]
+            span = (0.0, 0.85)
+        else:
+            tmp_out = os.path.join(os.path.dirname(out), "." + os.path.basename(out) + ".part.mp4")
+            tail += ["-movflags", "+faststart"]
+            span = (0.0, 1.0)
+
+        def x264_args():
+            preset = "veryfast" if preview else opts.preset
+            return ["-c:v", "libx264", "-preset", preset, "-crf", str(26 if preview else opts.crf), "-pix_fmt", "yuv420p"]
+
+        log(f"Rendering {os.path.basename(out)} ({len(segments)} zoom{'s' if len(segments) != 1 else ''}, {encoder})…")
+        err = None
+        if encoder == "vaapi" and not gif:
+            vgraph = os.path.join(work, "graph-vaapi.txt")
+            with open(vgraph, "w") as f:
+                f.write(";\n".join(graph[:-1] + [graph[-1].replace("format=yuv420p[out]", "format=nv12,hwupload[out]")]))
+            qp = "28" if preview else str(max(10, opts.crf + 2))
+            err = encode(head_cmd + ["-vaapi_device", device] + inputs, vgraph,
+                         tail + ["-c:v", "h264_vaapi", "-qp", qp], tmp_out, duration, span)
+            if err:
+                if opts.encoder == "vaapi":
+                    raise RenderError("ffmpeg_failed", f"VAAPI encode failed: {err}")
+                log(f"VAAPI encode failed, falling back to x264: {err}")
+                encoder = "x264"
+                err = None
+        if encoder == "x264" or gif:
+            err = encode(head_cmd + inputs, script, tail + x264_args(), tmp_out, duration, span)
+        if err:
+            raise RenderError("ffmpeg_failed", f"ffmpeg failed while rendering: {err}")
+
+        if gif:
+            palette = os.path.join(work, "palette.png")
+            gfps = min(opts.gif_fps, fps)
+            run_ffmpeg(["-i", mid, "-vf", f"fps={gfps:g},palettegen=stats_mode=diff", palette], "building the GIF palette")
+            emit({"progress": 0.9})
+            tmp_gif = os.path.join(os.path.dirname(out), "." + os.path.basename(out) + ".part.gif")
             try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-            if os.path.exists(tmp_out):
-                os.remove(tmp_out)
-            raise
-        if proc.wait() != 0:
-            if os.path.exists(tmp_out):
-                os.remove(tmp_out)
-            raise RenderError("ffmpeg_failed", f"ffmpeg failed while rendering: {err.strip()[-400:]}")
-        os.replace(tmp_out, out)
+                run_ffmpeg(["-i", mid, "-i", palette, "-lavfi",
+                            f"fps={gfps:g}[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle",
+                            tmp_gif], "writing the GIF")
+            except BaseException:
+                if os.path.exists(tmp_gif):
+                    os.remove(tmp_gif)
+                raise
+            os.replace(tmp_gif, out)
+        else:
+            os.replace(tmp_out, out)
         if not JSON_MODE:
             print("\r100%", file=sys.stderr)
-        return {"ok": True, "file": out, "duration": duration, "zooms": len(segments),
-                "cursor": draw_cursor, "events": events_path if have_events else None}
+        seg_out = [{"start": round(s["start"], 3), "end": round(s["end"], 3), "zoom": s["zoom"],
+                    "x": round(s["focus"][0][1] / w, 4), "y": round(s["focus"][0][2] / h, 4)} for s in segments]
+        return {"ok": True, "file": out, "duration": duration, "zooms": len(segments), "segments": seg_out,
+                "cursor": draw_cursor, "encoder": "gif" if gif else encoder,
+                "format": opts.format, "layout": layout, "size": [cw, ch],
+                "events": events_path if have_events else None}
     finally:
         if not opts.keep_temp:
             shutil.rmtree(work, ignore_errors=True)
@@ -643,14 +1164,31 @@ def main():
     r = sub.add_parser("render", help="render the studio cut of a recording")
     r.add_argument("video")
     r.add_argument("--events", help="events file (default: next to the video in .creator-mode/)")
-    r.add_argument("--out", help="output file (default: <video>-studio.mp4)")
+    r.add_argument("--out", help="output file (default: <video>-studio[-FORMAT][-preview].mp4|gif)")
     r.add_argument("--zoom", type=float, default=1.8, help="zoom level on clicks; 1 disables zoom (default 1.8)")
     r.add_argument("--background", default="theme",
-                   help=f"theme | {' | '.join(PRESETS)} | #rrggbb[:#rrggbb] | image path (default theme)")
+                   help=f"theme | wallpaper | {' | '.join(PRESETS)} | #rrggbb[:#rrggbb] | image path (default theme)")
+    r.add_argument("--blur", type=float, help="background image blur (default 28 for wallpaper, 0 for images)")
     r.add_argument("--padding", type=float, default=0.06, help="padding as a fraction of the frame; 0 = no frame")
-    r.add_argument("--radius", type=float, help="corner radius in px (default ~1.8%% of the height)")
+    r.add_argument("--radius", type=float, help="corner radius in px at 1080p (default ~19)")
+    r.add_argument("--shadow", type=float, default=0.5, help="shadow strength 0..1 (default 0.5)")
+    r.add_argument("--inset", type=float, default=0, help="inset border width in px at 1080p (default 0)")
+    r.add_argument("--inset-color", help="inset border color #rrggbb (default #ffffff)")
+    r.add_argument("--format", default="source", help=f"source | {' | '.join(FORMATS)} (default source)")
+    r.add_argument("--layout", default="auto", choices=("auto", "fit", "fill"),
+                   help="fit keeps the whole recording; fill crops it to the format and follows the cursor")
+    r.add_argument("--size", type=int, help="short side of the output in px (default: source, 1080 for formats)")
+    r.add_argument("--export", default="mp4", choices=("mp4", "gif"))
+    r.add_argument("--gif-fps", type=float, default=15)
+    r.add_argument("--quality", default="final", choices=("final", "preview"),
+                   help="preview renders at half size and 30 fps without motion blur")
+    r.add_argument("--encoder", default="auto", choices=("auto", "x264", "vaapi"),
+                   help="auto uses VAAPI when a test encode works, else x264")
+    r.add_argument("--smoothing", type=float, default=0.55, help="cursor smoothing 0..1 (default 0.55)")
+    r.add_argument("--hide-idle", type=float, default=2.5, help="hide the cursor after N idle seconds; 0 never")
     r.add_argument("--cursor-scale", type=float, default=1.4, help="cursor size multiplier (default 1.4)")
     r.add_argument("--no-cursor", action="store_true", help="don't draw a cursor")
+    r.add_argument("--no-motion-blur", dest="motion_blur", action="store_false")
     r.add_argument("--preset", default="medium", help="x264 preset (default medium)")
     r.add_argument("--crf", type=int, default=18, help="x264 quality, lower is better (default 18)")
     r.add_argument("--json-progress", action="store_true", help="machine-readable progress on stdout")
