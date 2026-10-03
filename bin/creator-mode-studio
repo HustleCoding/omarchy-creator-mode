@@ -71,6 +71,7 @@ DWELL_STILL = 6        # logical px of jitter allowed while resting
 DWELL_TIME = 0.45      # rest this long to count as a focus point
 DEADZONE = 0.35        # while zoomed, pan only once the cursor leaves the inner (1 - this) of the view
 PAN_STIFFNESS = 14.0   # camera pan spring (critically damped)
+CAMERA_TOL = 0.1       # work px the keyframed camera may stray from its path (keeps the motion per-frame smooth)
 
 # Cursor.
 JITTER = 1.5           # logical px of movement ignored as sensor noise
@@ -741,20 +742,49 @@ def camera_path(cursor, n_frames, fps, w, h, view, segments, fill):
     return out
 
 
-def camera_keyframed(camera, step):
-    """The viewport per frame as the renderer applies it: sampled every `step`
-    frames and linearly interpolated (see piecewise_expr)."""
+def camera_keyframes(camera, tol=CAMERA_TOL):
+    """Frame indices where the camera path needs a keyframe so that linear
+    interpolation between them stays within `tol` work px of the path. Rests
+    and steady glides collapse into one span; curves get a key every frame."""
     n = len(camera)
+    if n == 0:
+        return []
+    keys = [0]
+    a = 0
+    while a < n - 1:
+        b = n - 1
+        while b > a + 1 and not _chord_fits(camera, a, b, tol):
+            b = a + max(1, (b - a) // 2)
+        while b < n - 1 and _chord_fits(camera, a, b + 1, tol):
+            b += 1
+        keys.append(b)
+        a = b
+    return keys
+
+
+def _chord_fits(camera, a, b, tol):
+    span = b - a
+    for i in range(a + 1, b):
+        f = (i - a) / span
+        if any(abs(p + (q - p) * f - c) > tol
+               for p, q, c in zip(camera[a], camera[b], camera[i], strict=True)):
+            return False
+    return True
+
+
+def camera_keyframed(camera, keys):
+    """The viewport per frame as the renderer applies it: linearly
+    interpolated between the keyframes (see piecewise_expr)."""
     out = []
-    for i in range(n):
-        a = (i // step) * step
-        b = min(a + step, n - 1)
+    for a, b in zip(keys, keys[1:] + keys[-1:], strict=True):
         if b <= a:
             out.append(camera[a])
             continue
-        f = (i - a) / (b - a)
-        out.append(tuple(p + (q - p) * f for p, q in zip(camera[a], camera[b], strict=True)))
-    return out
+        for i in range(a, b):
+            f = (i - a) / (b - a)
+            out.append(tuple(p + (q - p) * f for p, q in zip(camera[a], camera[b], strict=True)))
+    out.append(camera[keys[-1]])
+    return out[:len(camera)]
 
 
 def to_output(states, camera, out_w, out_h):
@@ -793,25 +823,23 @@ def blur_windows(camera, fps, out_w, canvas_h):
     return [(max(0, a - 1) / fps, (b + 1) / fps) for a, b in windows if b - a >= 2]
 
 
-def piecewise_expr(values, step):
+def piecewise_expr(values, keys):
     """ffmpeg expression over `in` (frame index) that linearly interpolates
-    `values` sampled every `step` frames; zeros collapse into one branch. The
+    `values` between the frames in `keys`; zeros collapse into one branch. The
     expression is a balanced if-tree so evaluation stays O(log n) per frame."""
-    n = len(values)
     leaves = []  # (start, end, text)
-    for a in range(0, n, step):
-        b = min(a + step, n - 1)
-        va, vb = values[a], values[b]
+    for a, b in zip(keys, keys[1:] + [len(values)], strict=True):
+        va, vb = values[a], values[min(b, len(values) - 1)]
         if abs(va) < 0.01 and abs(vb) < 0.01:
             text = "0"
-        elif b == a or abs(vb - va) < 0.01:
+        elif b <= a or abs(vb - va) < 0.01:
             text = f"{va:.2f}"
         else:
             text = f"({va:.2f}+{(vb - va) / (b - a):.4f}*(in-{a}))"
         if leaves and leaves[-1][2] == text == "0":
-            leaves[-1] = (leaves[-1][0], a + step, "0")
+            leaves[-1] = (leaves[-1][0], b, "0")
         else:
-            leaves.append((a, a + step, text))
+            leaves.append((a, b, text))
 
     def build(lo, hi):
         if hi - lo == 1:
@@ -1426,7 +1454,7 @@ def render(opts):
         next_input = 1
 
         graph.append(f"{head}{','.join(pre)}[v0]")
-        step = max(1, int(round(fps / 15)))
+        keys = camera_keyframes(camera)
         out_vw, out_vh = (vid_w, vid_h) if pad > 0 else (cw, ch)
         # The cursor is drawn after the zoom, at output resolution, so it stays
         # sharp and moves in whole output pixels instead of magnified ones.
@@ -1442,7 +1470,7 @@ def render(opts):
             clicks_f = sorted(int(round(t * fps)) for t in clicks_v)
             blur = opts.motion_blur and not preview and not gif
             tracks_ = cursor_track(cursor, raw, clicks_f, fps, w, h, cursor_scale, opts.hide_idle, blur)
-            cam_eff = camera_keyframed(camera, step)
+            cam_eff = camera_keyframed(camera, keys)
             main, g1, g2, ring = (to_output(t_, cam_eff, out_vw, out_vh) for t_ in tracks_)
             zooms = [view[0] / c[2] for c in cam_eff]
             main, g1, g2 = (pick_tiles(t_, zooms, shapes, levels, rows) for t_ in (main, g1, g2))
@@ -1507,8 +1535,8 @@ def render(opts):
             top = [c[1] for c in camera]
             right = [c[0] + c[2] - w for c in camera]
             bottom = [c[1] + c[3] - h for c in camera]
-            L, T = piecewise_expr(left, step), piecewise_expr(top, step)
-            R, B = f"W+{piecewise_expr(right, step)}", f"H+{piecewise_expr(bottom, step)}"
+            L, T = piecewise_expr(left, keys), piecewise_expr(top, keys)
+            R, B = f"W+{piecewise_expr(right, keys)}", f"H+{piecewise_expr(bottom, keys)}"
             graph.append(f"{src}perspective=x0='{L}':y0='{T}':x1='{R}':y1='{T}':x2='{L}':y2='{B}':x3='{R}':y3='{B}'"
                          f":interpolation=cubic:eval=frame[z]")
             src = "[z]"
