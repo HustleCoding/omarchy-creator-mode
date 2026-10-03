@@ -15,8 +15,11 @@ SUPER + ALT + R   → Saving… → Rendering studio cut 42% → "Studio cut sav
 
 Studio is on by default (`S` toggles it, `B` cycles the background, `F` cycles the format). While recording, `bin/creator-mode-track`
 logs the cursor from Hyprland's IPC socket (~60 Hz) and, if `/dev/input/event*` is readable, mouse clicks and
-the *fact* that a key was pressed (never which key). The real cursor is hidden in the capture
-(`gpu-screen-recorder -cursor no`, only when the installed recorder supports it and the tracker is running).
+the *fact* that a key was pressed (never which key). The real cursor is hidden in the capture while
+the tracker runs: `gpu-screen-recorder -cursor no` where the recorder supports it, and, because some
+capture paths ignore that (Intel KMS keeps the cursor plane in the frame), Hyprland is also switched to a
+generated transparent cursor theme (`hyprctl setcursor`, which Hyprland syncs to gsettings for GTK apps)
+and switched back when the recording stops. `CREATOR_MODE_HIDE_CURSOR=off` keeps your theme untouched.
 After you stop, `bin/creator-mode-studio` renders `<name>-studio.mp4` next to the raw file:
 
 - **Auto-zoom** (1.8×) eased in just before each click, held while you click or type nearby. A typing burst

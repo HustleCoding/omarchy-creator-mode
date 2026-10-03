@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Write a fully transparent cursor theme (hyprcursor + XCursor) into DIR.
+
+Hyprland renders server-side cursors from the hyprcursor half; GTK clients that
+draw their own cursor pick up the XCursor half through gsettings. Idempotent.
+
+usage: creator-mode-cursor-theme DIR
+"""
+import io
+import struct
+import sys
+import zipfile
+import zlib
+from pathlib import Path
+
+SIZE = 24
+NAME = "creator-mode-hidden"
+SHAPES = """
+default left_ptr arrow pointer hand hand1 hand2 pointing_hand text xterm ibeam
+vertical-text vertical_text crosshair cross tcross grab grabbing openhand
+closedhand fleur move all-scroll all_scroll wait watch progress left_ptr_watch
+half-busy not-allowed crossed_circle forbidden no-drop dnd-no-drop help
+question_arrow whats_this context-menu copy dnd-copy alias dnd-link link
+dnd-move dnd-none dnd-ask cell plus zoom-in zoom_in zoom-out zoom_out
+n-resize s-resize e-resize w-resize ne-resize nw-resize se-resize sw-resize
+ns-resize ew-resize nesw-resize nwse-resize col-resize row-resize
+top_side bottom_side left_side right_side top_left_corner top_right_corner
+bottom_left_corner bottom_right_corner size_ver size_hor size_bdiag size_fdiag
+sb_v_double_arrow sb_h_double_arrow sb_up_arrow sb_down_arrow sb_left_arrow
+sb_right_arrow split_h split_v h_double_arrow v_double_arrow top_tee
+bottom_tee left_tee right_tee ul_angle ur_angle ll_angle lr_angle pencil
+pirate X_cursor x-cursor draft_large draft_small dotbox icon target
+""".split()
+
+
+def png_blank(size):
+    def chunk(kind, data):
+        c = kind + data
+        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+
+    raw = b"".join(b"\0" + b"\0" * 4 * size for _ in range(size))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def xcursor_blank(size):
+    image = struct.pack("<9I", 36, 0xFFFD0002, size, 1, size, size, 0, 0, 0) + b"\0" * 4 * size * size
+    header = struct.pack("<4sIII", b"Xcur", 16, 0x10000, 1)
+    toc = struct.pack("<III", 0xFFFD0002, size, 16 + 12)
+    return header + toc + image
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit(__doc__.strip())
+    root = Path(sys.argv[1])
+    stamp = root / ".version"
+    if stamp.is_file() and stamp.read_text() == "1\n":
+        return
+    (root / "hyprcursors").mkdir(parents=True, exist_ok=True)
+    (root / "cursors").mkdir(exist_ok=True)
+    (root / "manifest.hl").write_text(
+        f"name = {NAME}\ndescription = Transparent cursor used while Creator Mode records\n"
+        "version = 1\ncursors_directory = hyprcursors\n")
+    meta = (f"resize_algorithm = none\nhotspot_x = 0.0\nhotspot_y = 0.0\n"
+            f"define_override = {';'.join(SHAPES)}\ndefine_size = {SIZE}, blank.png\n")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("meta.hl", meta)
+        zf.writestr("blank.png", png_blank(SIZE))
+    (root / "hyprcursors" / "hidden.hlc").write_bytes(buf.getvalue())
+    (root / "index.theme").write_text(f"[Icon Theme]\nName={NAME}\nComment=Transparent cursor used while Creator Mode records\n")
+    blank = xcursor_blank(SIZE)
+    for shape in SHAPES:
+        (root / "cursors" / shape).write_bytes(blank)
+    stamp.write_text("1\n")
+
+
+if __name__ == "__main__":
+    main()
