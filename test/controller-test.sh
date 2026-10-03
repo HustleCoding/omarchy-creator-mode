@@ -163,6 +163,12 @@ unset FAKE_RECORDER_ARGS
 "$ROOT/test/fake-hypr-socket" "$TMP/hypr.sock" &
 sleep 0.3
 export CREATOR_MODE_HYPR_SOCKET="$TMP/hypr.sock" CREATOR_MODE_REGION="0,0,320,240" FAKE_RECORDER_ARGS="$TMP/args"
+# A fake hyprctl/gsettings pair stands in for the desktop whose cursor theme
+# is swapped out while recording.
+mkdir -p "$TMP/bin"
+ln -s "$ROOT/test/fake-hyprctl" "$TMP/bin/hyprctl"
+ln -s "$ROOT/test/fake-gsettings" "$TMP/bin/gsettings"
+export PATH="$TMP/bin:$PATH" FAKE_HYPRCTL_LOG="$TMP/hyprctl.log" XDG_DATA_HOME="$HOME/.local/share"
 
 run start --studio=maybe
 expect "unknown studio mode is rejected" '.ok == false and .error == "usage"'
@@ -170,9 +176,16 @@ expect "unknown studio mode is rejected" '.ok == false and .error == "usage"'
 run start --studio=on
 expect "studio start tracks the cursor" '.ok and .state == "recording" and .studio == true'
 check "real cursor is hidden while the tracker redraws it" bash -c "grep -qxF -- -cursor '$TMP/args' && grep -qxF -- no '$TMP/args'"
+theme="$XDG_DATA_HOME/icons/creator-mode-hidden"
+check "Hyprland is switched to the transparent cursor theme" bash -c "grep -qx 'setcursor creator-mode-hidden 24' '$FAKE_HYPRCTL_LOG'"
+check "transparent theme has a hyprcursor shape and XCursor files" bash -c "
+  grep -q 'cursors_directory = hyprcursors' '$theme/manifest.hl' && unzip -p '$theme/hyprcursors/hidden.hlc' meta.hl | grep -q 'define_override = default;' &&
+  [ \"\$(head -c4 '$theme/cursors/left_ptr')\" = Xcur ] && [ -s '$theme/cursors/text' ]"
+check "the desktop's own theme is recorded for the restore" bash -c "grep -qx 'cursor_theme=Bibata-Modern-Classic' '$CREATOR_MODE_STATE_DIR/state'"
 sleep 0.5
 run stop
 expect "studio stop reports the events file" '.ok and .state == "saved" and (.events | type) == "string"'
+check "the desktop's cursor theme is restored on stop" bash -c "tail -n1 '$FAKE_HYPRCTL_LOG' | grep -qx 'setcursor Bibata-Modern-Classic 24'"
 file=$(jq -r .file <<<"$out")
 events=$(jq -r .events <<<"$out")
 check "events file has a header, cursor samples and an end mark" bash -c "
@@ -235,12 +248,28 @@ expect "missing camera is a notice, not a failure" '.ok and .webcam == false and
 run stop
 unset CREATOR_MODE_WEBCAM_FORMAT CREATOR_MODE_WEBCAM_DEVICE
 
+# A crashed recorder must not leave the desktop without a cursor.
+: >"$FAKE_HYPRCTL_LOG"
+run start --studio=on
+pid=$(jq -r .pid <<<"$out")
+kill -KILL "$pid"; sleep 0.3
+run stop
+expect "stop after a recorder crash reports the unreadable file" '.ok == false and .error == "invalid_output"'
+check "cursor theme is restored after a recorder crash" bash -c "grep -qx 'setcursor Bibata-Modern-Classic 24' '$FAKE_HYPRCTL_LOG'"
+
+: >"$FAKE_HYPRCTL_LOG"
+CREATOR_MODE_HIDE_CURSOR=off run start --studio=on
+expect "CREATOR_MODE_HIDE_CURSOR=off still records with studio" '.ok and .studio == true'
+check "and leaves the cursor theme alone" bash -c "! grep -q setcursor '$FAKE_HYPRCTL_LOG'"
+run stop
+
+: >"$FAKE_HYPRCTL_LOG"
 CREATOR_MODE_HYPR_SOCKET="$TMP/missing.sock" run start --studio=on
 expect "tracker failure degrades to a plain recording" '.ok and .studio == false and (.notice | test("Cursor tracking failed"))'
-check "real cursor stays visible without the tracker" bash -c "! grep -qxF -- -cursor '$TMP/args'"
+check "real cursor stays visible without the tracker" bash -c "! grep -qxF -- -cursor '$TMP/args' && ! grep -q setcursor '$FAKE_HYPRCTL_LOG'"
 run stop
 expect "and still saves" '.ok and .state == "saved" and .events == null'
-unset FAKE_RECORDER_ARGS CREATOR_MODE_HYPR_SOCKET CREATOR_MODE_REGION
+unset FAKE_RECORDER_ARGS CREATOR_MODE_HYPR_SOCKET CREATOR_MODE_REGION FAKE_HYPRCTL_LOG
 
 echo
 echo "$pass passed, $failed failed"

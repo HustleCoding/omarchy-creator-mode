@@ -41,6 +41,10 @@ EDITOR_BIN="${CREATOR_MODE_EDITOR:-$BIN_DIR/creator-mode-editor}"
 WEBCAM_DEVICE="${CREATOR_MODE_WEBCAM_DEVICE:-/dev/video0}"
 WEBCAM_FORMAT="${CREATOR_MODE_WEBCAM_FORMAT:-v4l2}"
 WEBCAM_LOG="$STATE_DIR/webcam.log"
+HIDE_CURSOR="${CREATOR_MODE_HIDE_CURSOR:-auto}"
+HIDDEN_CURSOR_THEME="creator-mode-hidden"
+CURSOR_THEME_DIR="${CREATOR_MODE_CURSOR_THEME_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/icons/$HIDDEN_CURSOR_THEME}"
+CURSOR_THEME_BUILDER="$BIN_DIR/creator-mode-cursor-theme"
 
 json_str() {
   local s
@@ -122,6 +126,8 @@ load_state() {
   EVENTS=""
   WEBCAM_PID=""
   WEBCAM=""
+  CURSOR_THEME=""
+  CURSOR_SIZE=""
   [[ -f $STATE_FILE ]] || return 1
   PID=$(sed -n 's/^pid=//p' "$STATE_FILE")
   FILE=$(sed -n 's/^file=//p' "$STATE_FILE")
@@ -130,6 +136,8 @@ load_state() {
   EVENTS=$(sed -n 's/^events=//p' "$STATE_FILE")
   WEBCAM_PID=$(sed -n 's/^webcam_pid=//p' "$STATE_FILE")
   WEBCAM=$(sed -n 's/^webcam=//p' "$STATE_FILE")
+  CURSOR_THEME=$(sed -n 's/^cursor_theme=//p' "$STATE_FILE")
+  CURSOR_SIZE=$(sed -n 's/^cursor_size=//p' "$STATE_FILE")
   [[ $PID =~ ^[0-9]+$ && -n $FILE ]]
 }
 
@@ -157,6 +165,46 @@ stop_tracker() {
     waited=$((waited + 1))
   done
   tracker_alive && kill -KILL "$TRACKER_PID" 2>/dev/null
+  return 0
+}
+
+# The desktop's cursor theme: what Hyprland synced to gsettings (so GTK apps
+# agree with it), else what the session was started with.
+desktop_cursor_theme() {
+  local theme=""
+  command -v gsettings >/dev/null 2>&1 &&
+    theme=$(gsettings get org.gnome.desktop.interface cursor-theme 2>/dev/null | tr -d "'")
+  [[ -z $theme || $theme == "$HIDDEN_CURSOR_THEME" ]] && theme=${HYPRCURSOR_THEME:-${XCURSOR_THEME:-default}}
+  echo "$theme"
+}
+
+desktop_cursor_size() {
+  local size=${HYPRCURSOR_SIZE:-${XCURSOR_SIZE:-24}}
+  [[ $size =~ ^[1-9][0-9]*$ ]] || size=24
+  echo "$size"
+}
+
+# gpu-screen-recorder's `-cursor no` is ignored by some capture paths (Intel
+# KMS keeps the cursor plane in the frame), so while a studio recording runs
+# Hyprland is switched to a transparent cursor theme. CURSOR_THEME/CURSOR_SIZE
+# hold what restore_cursor puts back; they go into the state file so a later
+# `stop` (or recovery from a crash) can restore it too.
+hide_cursor() {
+  CURSOR_THEME="" CURSOR_SIZE=""
+  [[ $HIDE_CURSOR != off ]] || return 1
+  command -v hyprctl >/dev/null 2>&1 || return 1
+  python3 "$CURSOR_THEME_BUILDER" "$CURSOR_THEME_DIR" 2>>"$LOG_FILE" || return 1
+  local theme size
+  theme=$(desktop_cursor_theme)
+  size=$(desktop_cursor_size)
+  hyprctl setcursor "$HIDDEN_CURSOR_THEME" "$size" >/dev/null 2>>"$LOG_FILE" || return 1
+  CURSOR_THEME=$theme CURSOR_SIZE=$size
+}
+
+restore_cursor() {
+  [[ -n ${CURSOR_THEME:-} ]] || return 0
+  hyprctl setcursor "$CURSOR_THEME" "${CURSOR_SIZE:-24}" >/dev/null 2>>"$LOG_FILE" || hyprctl reload >/dev/null 2>&1
+  CURSOR_THEME="" CURSOR_SIZE=""
   return 0
 }
 
@@ -329,6 +377,7 @@ cmd_start() {
     if is_ours_alive; then
       fail "already_recording" "Creator Mode is already recording." ",\"file\":$(json_str "$FILE")"
     fi
+    restore_cursor
     rm -f "$STATE_FILE"
   fi
   PID=""
@@ -433,6 +482,7 @@ cmd_start() {
     fi
   fi
   : >"$LOG_FILE"
+  [[ -n $tracker_pid ]] && hide_cursor
   # setsid detaches the recorder from the shell process so restarting
   # omarchy-shell (or closing the panel) never interrupts a recording; 9>&- keeps
   # the long-lived recorder from inheriting (and holding) the control lock, and
@@ -463,6 +513,7 @@ cmd_start() {
     local code=$?
     stop_tracker
     stop_webcam
+    restore_cursor
     rm -f "$session" ${webcam_file:+"$webcam_file"}
     [[ -n $events ]] && rm -f "$events"
     rm -f "$file"
@@ -477,6 +528,7 @@ cmd_start() {
     kill -KILL "$pid" 2>/dev/null
     stop_tracker
     stop_webcam
+    restore_cursor
     rm -f "$session" ${webcam_file:+"$webcam_file"}
     [[ -n $events ]] && rm -f "$events"
     rm -f "$file"
@@ -485,8 +537,9 @@ cmd_start() {
 
   local started
   started=$(now_ms)
-  printf 'pid=%s\nfile=%s\nstarted=%s\naudio=%s\ntarget=%s\ntracker_pid=%s\nevents=%s\nwebcam_pid=%s\nwebcam=%s\n' \
-    "$pid" "$file" "$started" "$audio" "$target" "$tracker_pid" "$events" "$webcam_pid" "$webcam_file" >"$STATE_FILE.tmp"
+  printf 'pid=%s\nfile=%s\nstarted=%s\naudio=%s\ntarget=%s\ntracker_pid=%s\nevents=%s\nwebcam_pid=%s\nwebcam=%s\ncursor_theme=%s\ncursor_size=%s\n' \
+    "$pid" "$file" "$started" "$audio" "$target" "$tracker_pid" "$events" "$webcam_pid" "$webcam_file" \
+    "$CURSOR_THEME" "$CURSOR_SIZE" >"$STATE_FILE.tmp"
   mv "$STATE_FILE.tmp" "$STATE_FILE"
   refresh_omarchy_indicator
 
@@ -501,6 +554,7 @@ cmd_stop() {
 
   if is_ours_alive; then
     kill -INT "$PID" 2>/dev/null
+    restore_cursor
     stop_tracker
     stop_webcam
     local waited=0 limit=$((STOP_TIMEOUT * 10))
@@ -522,6 +576,7 @@ cmd_stop() {
   fi
   stop_tracker
   stop_webcam
+  restore_cursor
 
   rm -f "$STATE_FILE"
   refresh_omarchy_indicator

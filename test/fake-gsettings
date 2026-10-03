@@ -1,0 +1,7 @@
+#!/bin/bash
+# Stand-in for gsettings: the desktop's cursor theme is Bibata-Modern-Classic.
+case "$1 $3" in
+"get cursor-theme") echo "'Bibata-Modern-Classic'" ;;
+"get cursor-size") echo 24 ;;
+*) exit 1 ;;
+esac

@@ -1,0 +1,10 @@
+#!/bin/bash
+# Stand-in for hyprctl: logs every call to $FAKE_HYPRCTL_LOG and answers like
+# Hyprland would for the few commands the controller uses.
+[[ -n ${FAKE_HYPRCTL_LOG:-} ]] && printf '%s\n' "$*" >>"$FAKE_HYPRCTL_LOG"
+case $1 in
+setcursor)
+  if [[ $# -eq 3 ]]; then echo ok; else echo "usage: setcursor <theme> <size>"; exit 1; fi ;;
+monitors) echo "[]" ;;
+*) echo ok ;;
+esac
