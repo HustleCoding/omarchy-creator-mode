@@ -121,7 +121,9 @@ assert abs(xs[60 + 45] - 600) < 1 and abs(xs[30]) < 1  # settles on the rests
 acc = [abs(xs[i + 1] - 2 * xs[i] + xs[i - 1]) for i in range(1, 149)]
 assert max(acc) < 6, max(acc)                        # eases in/out instead of snapping
 assert st.smooth_cursor(moves, 10, 60, -1.0, ident, 0.55, 1.5)[0] is None
-cam = st.camera_keyframed([(0, 0, 100, 50), (0, 0, 100, 50), (20, 10, 50, 25)], 2)
+path = [(0, 0, 100, 50), (0, 0, 100, 50), (20, 10, 50, 25), (40, 20, 0, 0)]
+assert st.camera_keyframes(path) == [0, 1, 3]                 # rest, then one straight glide
+cam = st.camera_keyframed([(0, 0, 100, 50), (0, 0, 100, 50), (20, 10, 50, 25)], [0, 2])
 assert cam[1] == (10.0, 5.0, 75.0, 37.5)
 assert st.to_output([(0, 0, 45.0, 22.5), None], [(20, 10, 50, 25)] * 2, 1000, 500) == [(0, 0, 500.0, 250.0), None]
 PY
